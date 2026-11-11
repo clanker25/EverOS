@@ -1,0 +1,153 @@
+"""Shared pytest fixtures.
+
+Cache invalidation:
+    ``load_settings`` (and the timezone helper that reads it) are
+    ``functools.cache``-d for hot paths in production. Tests that
+    monkeypatch ``EVEROS_*`` env vars must see fresh settings on each
+    function — clear both caches around every test to keep results
+    deterministic regardless of declaration order.
+
+Cross-suite fixtures:
+    ``long_conversation`` lives here (not under ``tests/e2e/conftest.py``)
+    because both ``tests/e2e/`` and ``tests/integration/search/`` depend
+    on it — pytest conftest cascades down the directory tree, so a
+    fixture defined under ``tests/e2e/`` is invisible to siblings.
+"""
+
+from __future__ import annotations
+
+# Hermetic guard, before anything can import pymilvus (see the module).
+import tests._dotenv_guard  # noqa: F401  isort: skip
+
+# First import in the test process, on purpose. everos/__init__.py registers
+# the MSVC runtime DLL directory with the Windows loader, and that only helps
+# extensions imported *after* it -- sqlalchemy imports greenlet the moment it
+# is imported, and a test module's first line is often `from sqlmodel import`.
+# Any host application that imports sqlalchemy before everos has the same
+# problem; the package-init hook cannot reach it. Until a startup .pth ships
+# the registration for every interpreter in the environment, this line keeps
+# the suite meaningful on a Windows machine without the VC++ redistributable.
+import everos  # noqa: F401  isort: skip
+
+import json
+from collections.abc import AsyncIterator, Iterator
+from pathlib import Path
+
+import pytest
+
+from tests.fakes.storage import Storage, StorageView, make_storage, open_storage_view
+
+_FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures"
+_LONG_CONV_PATH = _FIXTURE_DIR / "long_conversation_locomo_caroline_melanie.json"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_everos_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Pin ``EVEROS_ROOT`` so no test reads the developer's own ``everos.toml``.
+
+    ``Settings`` resolves its TOML source through ``resolve_root()``, so any
+    field a test does not pass explicitly is filled from the real config file
+    on the machine running the suite. A developer who has, say, enabled
+    ``[observability]`` locally then sees failures in tests that assert the
+    default-off behaviour — green in CI, red on their machine, and unrelated to
+    whatever they were changing.
+
+    Tests that exercise root resolution itself override this: their own
+    ``setenv`` / ``delenv`` runs inside the test body, after this fixture.
+    """
+    monkeypatch.setenv("EVEROS_ROOT", str(tmp_path))
+
+
+def _reset_table_write_locks() -> None:
+    """Drop the per-table write-lock pools between tests.
+
+    Same hazard as ``_partition_locks`` above, one layer down: the pools are
+    class attributes, so a lock first acquired in one test's loop is handed to
+    the next test's loop and raises "bound to a different event loop". Each
+    backend ships the hook for exactly this -- three unit modules already call
+    it by hand, which is the tell that it belongs here instead.
+
+    The Milvus hook is behind an import guard because pymilvus is an optional
+    extra and the suite has to run without it.
+    """
+    from everos.infra.persistence.lancedb._base.repository import LanceRepoBase
+
+    LanceRepoBase._reset_locks_for_tests()
+    try:
+        from everos.infra.persistence.milvus.repository import MilvusRepoBase
+    except ImportError:
+        return
+    MilvusRepoBase._reset_locks_for_tests()
+
+
+@pytest.fixture(autouse=True)
+def _keep_token_counter_warmup_offline(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``Application.start`` warms tiktoken's encoding, which a fresh machine
+    downloads. Answer the probe locally so no test reaches the network; the
+    warm-up itself is tested with its own fakes in ``test_warmup.py``."""
+    monkeypatch.setattr("everos.service._warmup.encode", lambda text: [])
+
+
+@pytest.fixture(autouse=True)
+def _reset_settings_cache() -> Iterator[None]:
+    import structlog
+
+    from everos.config import load_settings
+    from everos.core.locks import LOCKS
+    from everos.core.utils import datetime as dt_module
+
+    # ``structlog.testing.capture_logs`` swaps structlog's global
+    # configuration, and every application build (``configure_process``)
+    # installs the production one. Reset structlog to defaults around every
+    # test so neither leaks into the next one.
+    # ``LOCKS`` caches one ``asyncio.Lock`` per (kind, key) -- session,
+    # owner and partition locks -- and never evicts it — correct for a single-loop
+    # production process, wrong across tests: pytest-asyncio gives each
+    # test its own event loop, so the second test to touch a partition
+    # gets a lock bound to a dead loop and the strategy dies with
+    # ``RuntimeError: ... is bound to a different event loop``. It hits
+    # the parametrised suites hardest, where both backends replay the
+    # same agent ids, and it surfaces as a dead-lettered OME run rather
+    # than a test error — reported as a flake on whichever parameter
+    # happens to run second.
+    structlog.reset_defaults()
+    load_settings.cache_clear()
+    dt_module._display_tz.cache_clear()
+    LOCKS.reset()
+    _reset_table_write_locks()
+    yield
+    structlog.reset_defaults()
+    load_settings.cache_clear()
+    dt_module._display_tz.cache_clear()
+    LOCKS.reset()
+    _reset_table_write_locks()
+
+
+@pytest.fixture
+async def storage(tmp_path: Path) -> AsyncIterator[Storage]:
+    """Real storage (system DB + LanceDB index) over the test's memory root."""
+    built = make_storage(tmp_path)
+    yield built
+    await built.aclose()
+
+
+@pytest.fixture
+async def storage_view(tmp_path: Path) -> AsyncIterator[StorageView]:
+    """A read-back handle on the storage an application writes under the root.
+
+    For tests that drive a whole application (which owns its connections)
+    and then assert on what it stored. Built on the backend the settings
+    select, so a fixture that picks the backend must be requested first.
+    """
+    from everos.config import load_settings
+
+    load_settings.cache_clear()
+    view = open_storage_view(tmp_path)
+    yield view
+    await view.aclose()
+
+
+@pytest.fixture(scope="session")
+def long_conversation() -> dict:
+    """LoCoMo conv_0 fixture (419 messages, 19 batches, one session)."""
+    return json.loads(_LONG_CONV_PATH.read_text())

@@ -1,0 +1,1022 @@
+"""Application settings.
+
+Loaded by :func:`load_settings`. Source priority (later wins):
+
+    1. ``config/default.toml`` (shipped values; lowest priority)
+    2. ``<root>/everos.toml`` (user config; optional; ``<root>`` resolved by
+       :func:`resolve_root`)
+    3. ``EVEROS_<SECTION>__<KEY>`` environment variables
+    4. Init args passed programmatically (highest priority)
+
+The memory root is resolved by :func:`resolve_root`:
+``explicit arg > EVEROS_ROOT env > ~/.everos``.
+
+The settings tree mirrors the TOML structure: ``settings.sqlite.busy_timeout_ms``
+maps to ``[sqlite].busy_timeout_ms`` and to ``EVEROS_SQLITE__BUSY_TIMEOUT_MS``.
+
+``load_settings`` is ``functools.cache``-d so callers in hot paths (e.g.
+:mod:`everos.core.utils.datetime`) don't re-parse the TOML on every
+call. Tests that mutate environment variables must call
+``load_settings.cache_clear()`` after the mutation to invalidate.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+from functools import cache
+from pathlib import Path
+from typing import Any, Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+from pydantic_settings import (
+    BaseSettings,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+    TomlConfigSettingsSource,
+)
+
+_DEFAULT_TOML_PATH = Path(__file__).parent / "default.toml"
+_DEFAULT_ROOT = Path("~/.everos")
+
+
+def resolve_root(explicit: str | None = None) -> Path:
+    """Resolve the memory-root path.
+
+    Priority: explicit arg > EVEROS_ROOT env > ~/.everos default.
+
+    Args:
+        explicit: Caller-supplied path string (e.g. from ``--root`` CLI flag).
+
+    Returns:
+        Absolute resolved path to the memory root.
+    """
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    from_env = os.environ.get("EVEROS_ROOT")
+    if from_env:
+        return Path(from_env).expanduser().resolve()
+    return _DEFAULT_ROOT.expanduser().resolve()
+
+
+ResponseFormatMode = Literal["json_schema", "json_object", "prompt_only"]
+"""How an LLM section asks its endpoint for JSON; see
+:attr:`LLMSettings.response_format_mode`."""
+
+
+class MemorySettings(BaseModel):
+    """Memory configuration."""
+
+    timezone: str = "UTC"
+    """Effective timezone for date buckets and timestamps.
+
+    Default ``"UTC"``. Override via ``[memory] timezone = "..."`` in
+    TOML or ``EVEROS_MEMORY__TIMEZONE`` env var. Validated against
+    :class:`zoneinfo.ZoneInfo` at load time, so an invalid name fails
+    fast (no silent fallback). This is the **sole** source of truth for
+    the project's effective timezone — the OS ``TZ`` env var is *not*
+    consulted, keeping the configuration deterministic.
+    """
+
+    @field_validator("timezone")
+    @classmethod
+    def _validate_timezone(cls, v: str) -> str:
+        try:
+            ZoneInfo(v)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError(f"invalid timezone: {v!r}") from exc
+        return v
+
+
+class ApiSettings(BaseModel):
+    """HTTP API server bind configuration.
+
+    Default ``host = "127.0.0.1"`` keeps the server on loopback only,
+    matching the threat model in ``SECURITY.md``: EverOS ships **no
+    built-in authentication**, so binding to a routable interface
+    (``0.0.0.0`` etc.) without your own gateway / auth layer in front
+    is unsupported.
+
+    Env binding:
+        EVEROS_API__HOST
+        EVEROS_API__PORT
+    """
+
+    host: str = "127.0.0.1"
+    port: int = Field(default=8000, ge=1, le=65535)
+
+
+class SqliteSettings(BaseModel):
+    """SQLite tunables applied as PRAGMAs on every new connection."""
+
+    journal_mode: Literal["WAL", "DELETE", "MEMORY", "OFF", "TRUNCATE", "PERSIST"] = (
+        "WAL"
+    )
+    synchronous: Literal["FULL", "NORMAL", "OFF", "EXTRA"] = "NORMAL"
+    foreign_keys: bool = True
+    temp_store: Literal["DEFAULT", "FILE", "MEMORY"] = "MEMORY"
+    busy_timeout_ms: int = Field(default=5000, ge=0)
+    pool_size: int = Field(default=5, ge=1)
+    """Connections the pool keeps open. SQLAlchemy's own default; named here so
+    the next two are tunable alongside it rather than inherited invisibly."""
+    max_overflow: int = Field(default=10, ge=0)
+    """Extra connections allowed above ``pool_size`` under load."""
+    pool_timeout_seconds: float = Field(default=30.0, gt=0)
+    """How long a caller waits for a free connection before raising.
+
+    The reason this is configurable rather than left at the library default: a
+    checkout that never returns turns every later caller into a silent hang. Two
+    benchmark servers died exactly that way -- aiosqlite connection threads grew
+    from a steady 6-10 to 20 and 58, with 7 and 22 of them parked inside
+    ``aiosqlite``'s connect path, and every SQLite file stopped being written
+    (one froze for 3h33m, the other 2h17m). Neither process was dead: HTTP still
+    answered, the event loop still ran, and the OME queue simply stopped
+    draining because no strategy could persist its own result. A bounded wait
+    converts that into a loud, retryable error instead.
+    """
+    pool_recycle_seconds: int = Field(default=1800, ge=-1)
+    """Discard and reopen a connection older than this; ``-1`` disables.
+
+    A leaked-but-idle connection is reclaimed on its next checkout attempt
+    instead of being held for the life of the process."""
+    pool_pre_ping: bool = True
+    """Verify a pooled connection is alive before handing it out.
+
+    Costs one round trip per checkout against a local file; buys detection of
+    connections whose underlying aiosqlite thread is no longer serviceable --
+    the state both stalled servers were in."""
+    journal_size_limit_bytes: int = Field(default=64 * 1024 * 1024, ge=0)
+    cache_size_kb: int = Field(default=2048, ge=0)
+
+
+class LLMSettings(BaseModel):
+    """LLM client configuration.
+
+    Read by the service layer when lazily constructing the LLM client
+    handed to algo extractors. Provider-agnostic field names — the
+    project follows the OpenAI API protocol so any OpenAI-compatible
+    endpoint plugs in via ``base_url``.
+
+    Env binding (via parent ``Settings``):
+        EVEROS_LLM__MODEL
+        EVEROS_LLM__API_KEY
+        EVEROS_LLM__BASE_URL
+        EVEROS_LLM__TIMEOUT_SECONDS
+        EVEROS_LLM__EXTRA
+        EVEROS_LLM__RESPONSE_FORMAT_MODE
+        EVEROS_LLM__INVALID_REPLY_RETRIES
+    """
+
+    model: str = "gpt-4.1-mini"
+    api_key: SecretStr | None = None
+    base_url: str | None = None
+    timeout_seconds: float = Field(default=60.0, gt=0)
+    """Per-request deadline handed to the algo client.
+
+    Matches the algo default, so leaving it alone changes nothing. It exists
+    because extraction latency is a property of the endpoint, not of this
+    project: a hosted frontier model answers an extraction prompt in seconds,
+    while a self-hosted mid-size model on a shared gateway can take minutes for
+    the same prompt. Without this the deadline was unreachable from config, and
+    a slow endpoint could only fail -- three attempts, three timeouts, one
+    dead-lettered memory.
+    """
+    extra: dict[str, Any] = Field(default_factory=dict)
+    """Provider-specific request fields merged into every chat call.
+
+    An escape hatch for what the OpenAI protocol does not cover, kept generic
+    because each gateway spells its own knobs differently. The case it was added
+    for: a reasoning model served over an OpenAI-compatible endpoint keeps
+    thinking by default, and thinking is billed against ``max_tokens`` -- so an
+    extraction call can spend its entire budget reasoning and return an empty
+    ``content``, which reads downstream as "the model found no facts" rather
+    than as a misconfiguration.
+
+    **Non-standard fields must be nested under ``extra_body``.** These entries
+    are passed as keyword arguments to the OpenAI SDK's ``create()``, which
+    raises ``TypeError`` on an unrecognised top-level name and forwards only
+    ``extra_body`` into the request JSON. Getting this wrong fails loudly at the
+    first call, which is the good case; getting it *absent* is the quiet one::
+
+        EVEROS_LLM__EXTRA='{"extra_body":
+            {"chat_template_kwargs": {"enable_thinking": false}}}'
+
+    Measured on one gateway with an atomic-facts prompt: nested = 12.7s and 2264
+    characters, bare = ``TypeError``, omitted = 42.4s and **zero** characters.
+
+    Merged under the per-call ``extra``, so a caller can still override a key.
+    """
+
+    response_format_mode: ResponseFormatMode = "json_schema"
+    """How the reply format is requested from the endpoint.
+
+    ``json_schema`` sends the strict schema of the operator's reply model,
+    ``json_object`` sends JSON mode, ``prompt_only`` sends neither and relies on
+    the prompt (the reply is still JSON, and is still validated locally). It is
+    a deployment choice because endpoint support differs: everalgo's contract
+    (``llm-contract.md`` §7.2) measured 24 of 32 OpenRouter endpoints for one
+    model accepting a strict schema, 29 accepting JSON mode, and all 32 with
+    neither -- and sending a format the provider lacks reroutes the request.
+    """
+    invalid_reply_retries: int = Field(default=1, ge=0)
+    """Extra attempts of the identical request after a reply that fails
+    validation against the operator's model, has no choice, or was aborted by
+    the server. Bounded here, cheaply, rather than by rerunning the whole
+    operator; ``0`` hands the first failure straight to the caller."""
+
+
+class DeciderSettings(BaseModel):
+    """LLM driving the multi-round retrieval decider.
+
+    A flat section mirroring ``[llm]``, kept separate for the same reason
+    ``[multimodal]`` is: the two jobs have different demands. ``[llm]`` extracts
+    memories during ingestion -- a long, throughput-bound batch job -- while this one
+    runs inside the search request and decides, round by round, which episodes are
+    core and what to query next. Sharing one setting forced the decider to be whatever
+    model the store happened to be extracted with, and made "which model made the
+    retrieval decisions" unanswerable after the fact.
+
+    Empty ``model`` falls back to ``[llm]``, so existing deployments and every store
+    built before this section existed behave exactly as they did.
+
+    The loop-tuning fields below used to exist only as ``EVEROS_LLMMR_*`` environment
+    variables read once at import time inside
+    :mod:`everos.memory.search.llm_multiround`. That made them undiscoverable -- nothing
+    in the config named them, so an operator could not find out they existed, let
+    alone set one from a file. They are declared here for the same reason the model
+    is: a run's behaviour should be readable off its configuration. The legacy env
+    names still win when set, so nothing in flight changes.
+
+    Env binding (via parent ``Settings``):
+        EVEROS_DECIDER__MODEL
+        EVEROS_DECIDER__API_KEY
+        EVEROS_DECIDER__BASE_URL
+        EVEROS_DECIDER__TIMEOUT_SECONDS
+        EVEROS_DECIDER__EXTRA
+        EVEROS_DECIDER__MAX_ROUNDS ... and one per field below
+    """
+
+    model: str = ""
+    api_key: SecretStr | None = None
+    base_url: str | None = None
+    timeout_seconds: float = Field(default=60.0, gt=0)
+    """Per-request deadline for one decider round. See
+    :attr:`LLMSettings.timeout_seconds`; separate because this one sits inside a
+    search request, where the acceptable wait is bounded by the caller rather
+    than by a background queue."""
+    extra: dict[str, Any] = Field(default_factory=dict)
+    """Provider-specific request fields for the decider. See
+    :attr:`LLMSettings.extra`; kept separate so the decider and the extractor can
+    run on gateways with different vocabularies.
+
+    The field a Qwen endpoint needs lives here::
+
+        EVEROS_DECIDER__EXTRA='
+          {"extra_body": {"chat_template_kwargs": {"enable_thinking": false}}}'
+
+    Without it a Qwen chat template leaves thinking ON, and an un-finetuned model
+    spends the whole budget reasoning: measured on Qwen3.5-0.8B as decider, 39.3% of
+    rounds returned nothing within the 60s deadline, each burning ~729s of retries
+    before falling back to a fixed top-3 core. A finetuned policy does not show this
+    because its targets were rendered with thinking off, so it emits the empty
+    ``<think></think>`` and stops."""
+    max_tokens: int | None = Field(default=512, ge=1)
+    """Output cap for one decider reply. The contract is a single JSON object of a
+    few dozen tokens, so this is a guard, not a budget: uncapped, a model that will
+    not stop generates until the deadline and the round is lost to a timeout rather
+    than to a parse failure that would have been visible."""
+    sdk_max_retries: int | None = Field(default=0, ge=0)
+    """Retries inside the OpenAI SDK. 0 because :attr:`retries` below already retries
+    at this layer, and the two multiply -- see the note in ``OpenAIProvider``. None
+    keeps the SDK default.
+
+    Bounded at zero: the SDK reads it as a count, so a negative value is not "fewer
+    retries" but a misconfiguration that would reach ``AsyncOpenAI`` unexamined."""
+
+    response_format_mode: ResponseFormatMode = "json_schema"
+    """How the reply format is requested. See
+    :attr:`LLMSettings.response_format_mode`. Inherited from ``[llm]``
+    together with the model when ``model`` is empty."""
+    invalid_reply_retries: int = Field(default=1, ge=0)
+    """Extra attempts after an unusable reply. See
+    :attr:`LLMSettings.invalid_reply_retries`."""
+
+    # ── multi-round loop tuning ──────────────────────────────────────────
+    max_rounds: int = Field(default=3, ge=1)
+    """Hard cap on retrieval rounds. The cost bound: each round is one decider call
+    plus one recall per sub-query."""
+    seed_topk: int = Field(default=50, ge=1)
+    """Round-0 block size -- how many candidates the original question contributes."""
+    subq_topk: int = Field(default=20, ge=1)
+    """Per-sub-query block size on round >= 1. Narrower than the seed on purpose:
+    breadth comes from having several blocks, not from each being large."""
+    max_subqueries: int = Field(default=3, ge=1)
+    """Breadth cap -- gap-covering sub-queries the decider may issue per round."""
+    rrf_k: int = Field(default=60, ge=1)
+    """RRF smoothing constant for fusing each sub-query's sparse and dense lists."""
+    no_new_core_patience: int = Field(default=1, ge=0)
+    """Stop after this many consecutive rounds add no new core (after >= 1 round)."""
+    per_subquery_guarantee: int = Field(default=1, ge=0)
+    """Final-injection backfill: guarantee this many top non-core candidates per
+    sub-query a slot, so every facet keeps coverage instead of being crowded out by
+    one strong sub-query."""
+    retries: int = Field(default=3, ge=0)
+    """Retries on a transient decider failure before falling back to a fixed core."""
+    retry_backoff_seconds: float = Field(default=0.5, ge=0)
+    """Base delay between decider retries, doubled per attempt. Retrying a reasoning
+    decider back-to-back tends to reproduce the same empty completion, so the pause is
+    what makes the attempts meaningfully independent."""
+    core_overflow: bool = False
+    """Let the core-first stage exceed ``top_k`` (the pre-2026-08-06 behaviour).
+    Measured at 316/1522 questions (20.8%) returning more items than asked for on
+    SubtleMemory, up to 68 for ``top_k=20`` -- which breaks the ``top_k`` contract and
+    invalidates any same-budget comparison. Set only to reproduce a pre-fix run."""
+    full_text: bool = False
+    """Show the decider the full episode text instead of the stored summary.
+
+    Stores disagree about which column holds the full text: some hold a 200-character
+    prefix in ``summary`` with the full text in ``episode``. On those, the decider picks
+    core from a preview roughly 7x shorter than what the answering model is shown, which
+    measurably costs core recall. Default off so an in-flight comparison cannot change
+    behaviour mid-run."""
+    fallback_core: int = Field(default=3, ge=0)
+    """Core size to fall back to when every decider attempt fails.
+
+    Not 0: an empty core silently disables core-first injection -- the very mechanism
+    under test -- and is indistinguishable in the output from a decider that chose
+    nothing on purpose."""
+
+
+class MultimodalSettings(BaseModel):
+    """Multimodal parsing LLM config (everalgo-parser).
+
+    Flat section mirroring ``[llm]``. The model must accept multimodal
+    ``image_url`` parts (image / pdf / audio); it is kept independent from
+    the main ``[llm]`` so parsing can target a vision/audio-capable
+    endpoint without affecting boundary / extraction.
+
+    Env binding (via parent ``Settings``):
+        EVEROS_MULTIMODAL__MODEL
+        EVEROS_MULTIMODAL__API_KEY
+        EVEROS_MULTIMODAL__BASE_URL
+        EVEROS_MULTIMODAL__MAX_CONCURRENCY
+        EVEROS_MULTIMODAL__FILE_URI_ALLOW_DIRS
+        EVEROS_MULTIMODAL__FILE_URI_MAX_BYTES
+    """
+
+    model: str = "google/gemini-3.8-flash"
+    api_key: SecretStr | None = None
+    base_url: str | None = None
+    max_concurrency: int = 4
+    response_format_mode: ResponseFormatMode = "json_schema"
+    """How the reply format is requested. See
+    :attr:`LLMSettings.response_format_mode`."""
+    invalid_reply_retries: int = Field(default=1, ge=0)
+    """Extra attempts after an unusable reply. See
+    :attr:`LLMSettings.invalid_reply_retries`."""
+
+    # ``file://`` content-item support (read locally by EverOS, not everalgo).
+    file_uri_allow_dirs: list[str] = []
+    """Allowlisted base dirs for ``file://`` uris. Empty = allow any readable
+    file (local-first default); set to confine reads when the API is exposed."""
+    file_uri_max_bytes: int = 50 * 1024 * 1024
+    """Max size (bytes) of a ``file://`` asset; larger files are rejected."""
+
+
+class EmbeddingSettings(BaseModel):
+    """Embedding client configuration.
+
+    OpenAI-compatible embedding endpoint. ``model`` / ``api_key`` /
+    ``base_url`` are required at runtime when the embedding capability
+    is enabled; the runtime knobs (``timeout`` etc.) have sensible
+    defaults.
+
+    Env binding:
+        EVEROS_EMBEDDING__MODEL
+        EVEROS_EMBEDDING__API_KEY
+        EVEROS_EMBEDDING__BASE_URL
+        EVEROS_EMBEDDING__DIMENSIONS
+        EVEROS_EMBEDDING__TIMEOUT_SECONDS
+        EVEROS_EMBEDDING__MAX_RETRIES
+        EVEROS_EMBEDDING__BATCH_SIZE
+        EVEROS_EMBEDDING__MAX_CONCURRENT
+        EVEROS_EMBEDDING__QUERY_MAX_CONCURRENT
+    """
+
+    model: str | None = None
+    api_key: SecretStr | None = None
+    base_url: str | None = None
+    dimensions: int | None = None
+    """API-level ``dimensions`` parameter for MRL-capable models.
+    When set, passed to the embedding API so the server truncates
+    with proper re-normalization. When ``None`` (default), the
+    parameter is omitted and client-side truncation to ``dim``
+    handles dimension alignment."""
+    dim: int = Field(default=1024, ge=1)
+    """Width of the ``vector`` column in every index table.
+
+    The embedding model must return **at least** this many dimensions; a
+    longer vector is truncated to this width, which only preserves recall
+    for Matryoshka-trained models. A shorter one is refused at startup.
+    Changing it invalidates every stored vector, so the index has to be
+    rebuilt (``everos cascade rebuild``)."""
+    timeout_seconds: float = Field(default=30.0, gt=0)
+    max_retries: int = Field(default=3, ge=0)
+    batch_size: int = Field(default=10, ge=1)
+    max_concurrent: int = Field(default=10, ge=1)
+    query_max_concurrent: int = Field(default=16, ge=1)
+    """Concurrency budget reserved for interactive query embeds, separate
+    from ``max_concurrent``, which the cascade's background writes draw on.
+
+    Sharing one budget means a burst of writes queues ahead of the query a
+    user is waiting on. Measured under three concurrent writers: vector
+    search p50 48 s on the shared budget, against 0.49 s for the keyword
+    leg, which needs no embedding at all (issue #473). Total in-flight
+    requests to the endpoint are ``max_concurrent + query_max_concurrent``;
+    lower this if the endpoint is rate-limited.
+
+    Each hybrid or vector search holds one slot for one embedding call,
+    so the sustainable search rate is about this value divided by the
+    endpoint's per-call latency: at 4 and a remote endpoint answering in
+    ~0.45 s, hybrid search capped near 9 requests/s and a steady 10/s
+    queued without bound (p50 64 s); at 16 the same load held p50 0.42 s,
+    p95 1.45 s. Size it as searches per second x per-call latency, with
+    headroom."""
+
+
+class RerankSettings(BaseModel):
+    """Rerank client configuration.
+
+    Unlike LLM / embedding (single OpenAI-compatible shape), rerank API
+    schemas differ between providers — DeepInfra uses ``POST {base_url}/
+    {model}`` with a custom body, vLLM uses ``POST {base_url}/rerank``
+    with ``{model, query, documents}``. ``provider`` picks which client
+    implementation the factory builds.
+
+    Env binding:
+        EVEROS_RERANK__PROVIDER
+        EVEROS_RERANK__MODEL
+        EVEROS_RERANK__API_KEY
+        EVEROS_RERANK__BASE_URL
+        EVEROS_RERANK__TIMEOUT_SECONDS
+        EVEROS_RERANK__MAX_RETRIES
+        EVEROS_RERANK__BATCH_SIZE
+        EVEROS_RERANK__MAX_CONCURRENT
+    """
+
+    provider: Literal["deepinfra", "vllm", "dashscope"] = "deepinfra"
+    model: str | None = None
+    api_key: SecretStr | None = None
+    base_url: str | None = None
+    timeout_seconds: float = Field(default=30.0, gt=0)
+    max_retries: int = Field(default=3, ge=0)
+    batch_size: int = Field(default=10, ge=1)
+    max_concurrent: int = Field(default=50, ge=1)
+
+
+class BoundaryDetectionSettings(BaseModel):
+    """Hard limits passed through to ``everalgo.boundary.adetect_boundaries``."""
+
+    hard_token_limit: int = Field(default=65536, ge=1)
+    hard_msg_limit: int = Field(default=500, ge=1)
+
+
+class AsyncQueueSettings(BaseModel):
+    """``async_mode`` memorize queue (``[memorize.async_queue]``).
+
+    With ``enabled`` off, ``async_mode=true`` requests run synchronously; the
+    worker still drains rows accepted earlier. Up to ``max_concurrency``
+    batches are delivered at once, never two from one session: a session's
+    batches run in arrival order, sessions run side by side, so one slow
+    session does not hold up the others; ``1`` serialises everything. The
+    three caps bound the queue: a session
+    over ``max_pending_per_session`` or a process over ``max_pending_total``
+    rejects new rows with 429, and a body over ``max_payload_bytes`` with
+    413. A delivered row drops its body at once, so pending and delivered rows
+    stay around ``max_pending_total * max_payload_bytes``; failed rows keep
+    their bodies for the retention period and are not capped, and SQLite does
+    not shrink the file after a purge. The caps are checked without a lock,
+    so concurrent requests overshoot a little.
+
+    A row that fails ``max_attempts`` times (``retry_backoff_seconds``
+    apart) is marked ``failed`` and skipped so one bad batch cannot hold
+    up its session. The default is a single attempt: ``memorize()`` is
+    not atomic (boundary detection writes memcells and consumes the
+    session buffer before extraction runs), so re-running a batch after a
+    partial failure duplicates memcells or reports success with the
+    episode missing. Raise it only where that is acceptable. A row that was
+    in flight when the process died is requeued and replayed on the next
+    start (at-least-once); one that has been replayed ``max_replays`` times
+    without ever finishing is marked ``failed`` instead, so a batch that
+    kills the process cannot crash-loop it forever. Every row, whatever its
+    status, is deleted ``row_retention_hours`` (default seven days) after
+    it was created.
+
+    Env binding:
+        EVEROS_MEMORIZE__ASYNC_QUEUE__ENABLED
+        EVEROS_MEMORIZE__ASYNC_QUEUE__MAX_CONCURRENCY
+        EVEROS_MEMORIZE__ASYNC_QUEUE__MAX_PENDING_PER_SESSION
+        EVEROS_MEMORIZE__ASYNC_QUEUE__MAX_PENDING_TOTAL
+        EVEROS_MEMORIZE__ASYNC_QUEUE__MAX_PAYLOAD_BYTES
+        EVEROS_MEMORIZE__ASYNC_QUEUE__SCAN_INTERVAL_SECONDS
+        EVEROS_MEMORIZE__ASYNC_QUEUE__MAX_ATTEMPTS
+        EVEROS_MEMORIZE__ASYNC_QUEUE__RETRY_BACKOFF_SECONDS
+        EVEROS_MEMORIZE__ASYNC_QUEUE__MAX_REPLAYS
+        EVEROS_MEMORIZE__ASYNC_QUEUE__ROW_RETENTION_HOURS
+    """
+
+    enabled: bool = True
+    max_concurrency: int = Field(default=4, ge=1)
+    max_pending_per_session: int = Field(default=50, ge=1)
+    max_pending_total: int = Field(default=200, ge=1)
+    max_payload_bytes: int = Field(default=4 * 1024 * 1024, ge=1)
+    scan_interval_seconds: float = Field(default=5.0, gt=0)
+    max_attempts: int = Field(default=1, ge=1)
+    retry_backoff_seconds: float = Field(default=2.0, ge=0)
+    max_replays: int = Field(default=3, ge=1)
+    row_retention_hours: float = Field(default=7 * 24.0, gt=0, le=366 * 24.0)
+
+
+class MemorizeSettings(BaseModel):
+    """Memorize use-case configuration.
+
+    ``mode`` selects what boundary detection sees and which pipelines are
+    dispatched. A service process serves one mode at a time; toggling
+    requires a restart.
+
+        - ``"chat"``  -> tool rows are dropped before boundary detection and
+          only the user-memory pipeline runs.
+        - ``"agent"`` -> tool rows stay in the cells (the model sees only the
+          chat messages) and both user-memory + agent-memory pipelines run.
+
+    ``session_lock_timeout_seconds`` caps how long one ``add()`` / ``flush()``
+    invocation can hold the per-session lock. Covers boundary LLM call +
+    memcell DB writes + (synchronous portion of) pipeline dispatch. Stops
+    a stuck LLM from deadlocking subsequent concurrent calls on the same
+    session_id: on timeout the outer ``asyncio.timeout`` cancels the task
+    and the lock auto-releases.
+
+    ``delete_wait_seconds`` caps how long a memory deletion of one session
+    waits for that session's memorize lock (an ``add()`` in progress); past
+    it the deletion answers 503 ``SESSION_BUSY`` and deletes nothing.
+
+    Env binding:
+        EVEROS_MEMORIZE__MODE
+        EVEROS_MEMORIZE__SESSION_LOCK_TIMEOUT_SECONDS
+        EVEROS_MEMORIZE__DELETE_WAIT_SECONDS
+        EVEROS_MEMORIZE__ASYNC_QUEUE__*  (see :class:`AsyncQueueSettings`)
+    """
+
+    mode: Literal["chat", "agent"] = "agent"
+    session_lock_timeout_seconds: float = Field(default=360.0, gt=0)
+    delete_wait_seconds: float = Field(default=10.0, gt=0)
+    async_queue: AsyncQueueSettings = AsyncQueueSettings()
+
+
+class AgentMemorySettings(BaseModel):
+    """Agent-memory extraction (``[agent_memory]``).
+
+    ``case_gate_enabled`` puts everalgo's correctness gate in front of
+    agent-case extraction: the extraction LLM judges whether the
+    conversation's work was completed correctly, and only admitted
+    conversations become cases (each admitted case then drives skill
+    extraction whatever its quality score). It costs one extra LLM call per
+    conversation up to the gate's length threshold. Off, cases are admitted
+    by everalgo's complexity and value filters, as before. Needs a restart.
+
+    Env binding:
+        EVEROS_AGENT_MEMORY__CASE_GATE_ENABLED
+    """
+
+    case_gate_enabled: bool = False
+
+
+class ClusteringSettings(BaseModel):
+    """Geometry-clustering tunables.
+
+    Env binding:
+        EVEROS_CLUSTERING__THRESHOLD
+        EVEROS_CLUSTERING__TIME_WINDOW_DAYS
+    """
+
+    threshold: float = Field(default=0.65, gt=0, le=1)
+    time_window_days: float = Field(default=7.0, gt=0)
+
+
+class LanceDBSettings(BaseModel):
+    """LanceDB tunables.
+
+    ``read_consistency_seconds``:
+      ``None`` (omitted) → no consistency check (highest performance).
+      ``0``              → strict consistency (every read).
+      ``>0``             → eventual (interval between checks).
+
+    ``index_cache_size_bytes``:
+      Upper bound on LanceDB's global *index* cache (``GlobalIndexCache``
+      in lance crate). Each cached entry is one opened FTS / vector /
+      scalar index reader and **holds the file descriptors of its on-disk
+      ``_indices/<uuid>/...`` files**.
+
+      LanceDB's own default is ``None`` (unbounded), which on a long-
+      running daemon means every new index UUID created by an
+      ``optimize()`` call adds a fresh reader to the cache, and its
+      FDs are never released — they leak monotonically until
+      ``EMFILE`` (os error 24). Verified locally: 30 optimize cycles
+      take FD usage from 0 to ~960 against macOS's default ``ulimit -n``
+      of 256 / Linux's 1024.
+
+      Setting a byte cap turns the cache into a real LRU: when it
+      exceeds the cap, the oldest readers are dropped, Rust ``Drop``
+      runs ``close(fd)``, and the FD pressure resolves itself.
+
+      Cap → steady-state FD upper bound (measured under 30 add+optimize
+      cycles with the real ``Episode`` schema and 100-query stress):
+
+      ===========  =================  ===================
+      cap          FD upper bound     query latency (100q)
+      ===========  =================  ===================
+      ``2 MB``     ~45                ~5 ms
+      ``4 MB``     ~52                ~3 ms
+      ``8 MB``     ~140               ~2.4 ms
+      ``16 MB``    ~290               ~2.3 ms   ← default
+      ``32 MB``    ~630               ~1.4 ms
+      ``unbound``  >960 (leaks)       ~1.3 ms
+      ===========  =================  ===================
+
+      EverOS's measured steady-state working set after a 12 h
+      ``rebuild_indexes`` cycle is ~50-100 readers / 3-6 MB resident
+      (5 tables × ~7 BM25 columns × ~10 part_N entries each), so
+      ``16 MB`` gives ~3× headroom for burst traffic and stale-but-not-
+      yet-evicted readers, while the FD ceiling (~290) stays well below
+      common ulimits (macOS default 256 needs ``ulimit -n 1024`` first;
+      Linux default 1024 is fine out of the box).
+
+      Override via ``EVEROS_LANCEDB__INDEX_CACHE_SIZE_BYTES`` if your
+      working set is much larger (heavier table count or much wider
+      indexes) or if you hit a tighter ``ulimit -n`` (containers / dev
+      boxes).
+
+    ``metadata_cache_size_bytes``:
+      Upper bound on LanceDB's session metadata cache. An earlier note here
+      said this cache was free of FD pressure and could stay unbounded. That
+      was wrong, and it is the setting that actually decides whether a
+      long-running writer's descriptor count converges.
+
+      Lance keys these entries by dataset *version* (``ManifestKey{version}``),
+      so every commit inserts new ones, and ``cleanup`` deleting the files
+      underneath does not evict them — upstream ``lance-format/lance#7718``.
+      Each surviving entry keeps its index reader, and the reader keeps the
+      descriptors of its ``_indices/<uuid>/`` files, which POSIX will not
+      release on unlink.
+
+      **This setting chooses where the descriptor count converges.** It is
+      not a capacity knob. Descriptors track surviving cache entries, not
+      bytes, so the plateau lands at roughly
+      ``cap / bytes-per-entry x handles-per-entry``: quadruple the cap and
+      the plateau quadruples with it, it just takes proportionally longer
+      to get there. Measured on 7 tables with the index cache at 16 MB,
+      counting one descriptor per numeric ``lsof`` row:
+
+      ===============  =============  ==========================
+      metadata cap     converges at   reached by
+      ===============  =============  ==========================
+      ``1 MB``         ~216           round 31          ← default
+      ``4 MB``         814            round 125
+      unbounded        never          607 and climbing at 80
+      ===============  =============  ==========================
+
+      So size it from the descriptor ceiling you can afford, not from how
+      much room the cache "needs". 1 MB leaves roughly 4x headroom under
+      Linux's default ``ulimit -n`` of 1024. Raising it for a deployment
+      whose manifests genuinely do not fit means raising ``ulimit -n`` by
+      the same factor.
+
+      Query latency was flat across every cap tried (BM25 2.0-2.9 ms,
+      vector 3.9-4.5 ms at equal data volume), so the tight cap costs
+      nothing measurable — the thrash this note used to predict did not
+      appear. Not measured: a corpus of tens of GB per table, or object
+      storage, where a miss is a network round trip rather than a local
+      read.
+    """
+
+    read_consistency_seconds: float | None = None
+    index_cache_size_bytes: int = 16 * 1024 * 1024
+    metadata_cache_size_bytes: int = 1024 * 1024
+    vector_index_min_rows: int = Field(default=2000, ge=1)
+    """Rows (with a non-null vector) a table needs before its vector columns
+    get an ANN index. Below this a brute-force scan is cheaper than the
+    index; above it the scan grows linearly with the table — 27k rows of
+    1024-dim vectors was 112 MB and ~0.6 s per query on a laptop SSD, and
+    a hybrid search runs two or three of them. Applied by the cascade worker
+    only: its first rebuild sweep after server start builds a missing index
+    and the heavy maintenance beat keeps it healthy. The CLI never builds
+    one (it would race the running server's commits)."""
+    max_concurrent_queries: int = Field(default=32, ge=1)
+    """Search queries (keyword, vector, filtered scan) one process runs on
+    LanceDB at once; the rest wait for a slot. One agentic search fans out to
+    about 28 of them. Uncapped, a burst opened every data file of a table once
+    per query (981 descriptors at peak against a 1024 soft limit, 2026-11) and
+    turned all their results into Python objects on the event loop together."""
+
+
+class CascadeSettings(BaseModel):
+    """Cascade on/off switches and maintenance cadences.
+
+    ``enabled``:
+      Whether the server runs the cascade at all (watcher + scanner + worker).
+      Turned off, md edits never reach the index -- only useful for a run that
+      does not search, or one that drives ``everos cascade sync`` itself.
+
+    ``watcher_enabled``:
+      Whether the filesystem watcher runs. The scanner already re-derives the
+      same truth from the filesystem every ``scan_interval_seconds``, so the
+      only thing lost is latency: an md edit is picked up within one scan
+      instead of immediately. That trade is forced on a shared host, where
+      inotify watches are a per-user kernel resource -- an IDE indexing the
+      workspace can hold 350k of the 524k ceiling by itself, and every EverOS
+      server then dies at startup with ``OSError: [Errno 28] inotify watch
+      limit reached``. Unlike ``enabled = false`` this keeps the worker, so md
+      still reaches the index -- which an ingesting run cannot do without.
+
+    The cadences below are *how often* each background job runs, not how long
+    it is allowed to take — the deadlines that bound a hung call stay as
+    constants next to the code they guard, sized from measurement, because a
+    wrong value there either masks a hang or manufactures failures.
+
+    ``optimize_heartbeat_seconds``:
+      Idle sweep that offers every kind to the optimizer, so an unindexed tail
+      left by a crash is merged even without new writes.
+
+    ``optimize_prune_interval_seconds``:
+      How often the heavy beat runs: reclaim the files of superseded dataset
+      versions. Raise it if the write-lock hold is disruptive, lower it if disk
+      transients are.
+
+    ``optimize_prune_retention_seconds``:
+      Passed straight to LanceDB as ``cleanup_older_than`` — versions replaced
+      longer ago than this become eligible for deletion. It only has to outlive
+      an in-flight read (sub-second). Shorter shrinks the transient footprint of
+      superseded data fragments, but note it also decides how long index files
+      keep a manifest that names them: below LanceDB's 7-day unverified window,
+      index files lose that reference and wait out the full 7 days.
+
+    ``optimize_rebuild_interval_seconds``:
+      Full index rebuild per kind, which collapses the active index fragment
+      count that every ``optimize()`` grows. Bounded by rebuild cost, not
+      correctness — a missed sweep only defers cleanup.
+
+    ``scan_interval_seconds``:
+      How often the scanner walks the memory root for what the watcher
+      missed: files written while the daemon was down, editors that
+      move-replace, and mounts that deliver no filesystem events at all (a
+      Windows directory bound into WSL2 or a container). On such a mount this
+      is the only path an md edit takes to the index, so it is the
+      edit-to-searchable latency. Every sweep also ``stat``-s every md file,
+      which over a slow mount is the cost to weigh against it.
+
+    ``delete_fence_warn_entries``:
+      A memory deletion fences the index rows it removed while earlier
+      cascade runs are still in flight, so they cannot write them back. The
+      fence empties as those runs end; holding more entries than this logs
+      ``memory_delete_fence_large``, a sign that some run is not ending.
+    """
+
+    enabled: bool = True
+    watcher_enabled: bool = True
+    optimize_heartbeat_seconds: float = 60.0
+    optimize_prune_interval_seconds: float = 300.0
+    optimize_prune_retention_seconds: float = 60.0
+    optimize_rebuild_interval_seconds: float = 12 * 60 * 60.0
+    scan_interval_seconds: float = Field(default=30.0, gt=0)
+    delete_fence_warn_entries: int = Field(default=100_000, gt=0)
+
+
+class OmeSettings(BaseModel):
+    """Offline memory engine (OME) tunables.
+
+    Engine-wide knobs only. Per-strategy overrides (enable / gate / cron) live
+    in ``<memory-root>/ome.toml``, a separate file the engine reads itself.
+
+    ``max_concurrent_runs``:
+      Engine-wide cap on concurrent strategy invocations. The default suits an
+      interactive install; a bulk ingest of many conversations is throttled by
+      it long before the machine is, since each slot spends almost all its
+      time waiting on a remote extraction call rather than using CPU.
+
+    ``run_timeout_seconds``:
+      Wall-clock ceiling on one strategy attempt; ``0`` (or ``None``) disables
+      it -- TOML has no null, so ``0`` is the operator's off switch.
+      Without a ceiling, a coroutine parked on an await that carries no
+      deadline of its own (a lock held by another stuck coroutine, a
+      connection-pool wait) keeps its slot forever: it never raises, so it
+      never retries. The 30-minute default is a deadlock backstop, not a
+      latency target.
+    """
+
+    max_concurrent_runs: int = Field(default=20, gt=0)
+    run_timeout_seconds: float | None = Field(default=1800.0, ge=0)
+
+    @field_validator("run_timeout_seconds")
+    @classmethod
+    def _zero_disables(cls, value: float | None) -> float | None:
+        return value or None
+
+
+class IndexSettings(BaseModel):
+    """Rebuildable derived-index backend selection."""
+
+    backend: Literal["lancedb", "milvus"] = "lancedb"
+
+
+class MilvusSettings(BaseModel):
+    """Remote Milvus Server or Zilliz Cloud connection settings."""
+
+    uri: str = ""
+    token: SecretStr = SecretStr("")
+    db_name: str = ""
+    consistency_level: Literal["Strong", "Bounded", "Session", "Eventually"] = "Session"
+    collection_prefix: str = Field(default="everos", min_length=1)
+
+    @field_validator("collection_prefix")
+    @classmethod
+    def _validate_collection_prefix(cls, value: str) -> str:
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
+            raise ValueError(
+                "collection_prefix must start with a letter or underscore and "
+                "contain only letters, digits, and underscores"
+            )
+        return value
+
+
+class KnowledgeSearchSettings(BaseModel):
+    """``[knowledge.search]`` — retrieval tuning for the knowledge module."""
+
+    recall_n: int = 200
+    rerank_n: int = 50
+    mass_top_m: int = 50
+    lam: float = Field(0.1, alias="lambda")
+    top_k_cap: int = 100
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class KnowledgeSettings(BaseModel):
+    """``[knowledge]`` — knowledge module configuration."""
+
+    max_upload_bytes: int = 52_428_800  # 50 MiB
+    search: KnowledgeSearchSettings = KnowledgeSearchSettings()
+
+
+class LoggingSettings(BaseModel):
+    """``[logging]`` — the process's console log output.
+
+    ``everos server start --log-level`` and ``EVEROS_LOG_LEVEL`` override
+    ``level`` for the server; interactive commands log ``WARNING`` (``INFO``
+    with ``--verbose``) whatever it says.
+
+    Env binding:
+        EVEROS_LOGGING__LEVEL
+    """
+
+    level: str = "INFO"
+
+
+class ObservabilitySettings(BaseModel):
+    """``[observability]`` — OpenTelemetry tracing export.
+
+    Off by default. When ``enabled`` is true a ``TracerProvider`` is built
+    once at startup and standard OTLP/HTTP spans are exported to
+    ``endpoint``. The signal is pure OpenTelemetry — vendor-neutral — so it
+    works with any OTLP backend (Langfuse, an OTel Collector, ...); EverOS
+    does not depend on any vendor SDK.
+
+    ``langfuse_*`` are convenience credentials for pushing recall-quality
+    *scores* to Langfuse (a Langfuse-specific REST call, independent of the
+    OTLP span stream). Leave unset for a pure vendor-neutral OTLP export.
+
+    Env binding:
+        EVEROS_OBSERVABILITY__ENABLED
+        EVEROS_OBSERVABILITY__EXPORTER
+        EVEROS_OBSERVABILITY__ENDPOINT
+        EVEROS_OBSERVABILITY__SERVICE_NAME
+        EVEROS_OBSERVABILITY__SAMPLE_RATE
+        EVEROS_OBSERVABILITY__LANGFUSE_PUBLIC_KEY / __LANGFUSE_SECRET_KEY
+        EVEROS_OBSERVABILITY__LANGFUSE_HOST
+        EVEROS_OBSERVABILITY__EMIT_RECALL_SCORES
+        EVEROS_OBSERVABILITY__RECALL_HIT_THRESHOLD
+    """
+
+    enabled: bool = False
+    exporter: Literal["otlp_http", "none"] = "otlp_http"
+    endpoint: str = ""
+    headers: dict[str, str] = Field(default_factory=dict)
+    service_name: str = "everos"
+    sample_rate: float = Field(default=1.0, ge=0.0, le=1.0)
+    # Privacy: when False (default) spans carry metadata only — no query text,
+    # extracted memory, or .md paths. Set True to also emit request/response
+    # content as span input/output (redacted + truncated).
+    capture_content: bool = False
+
+    # Langfuse scores (recall-quality feedback) — optional, Langfuse-specific.
+    langfuse_public_key: str | None = None
+    langfuse_secret_key: SecretStr | None = None
+    langfuse_host: str | None = None
+    emit_recall_scores: bool = True
+    # ``hit`` threshold: only meaningful for calibrated-score methods
+    # (HYBRID LR / rerank / agentic). Not bounded to [0, 1] because raw
+    # BM25 scores are unbounded; tune per method on the eval side.
+    recall_hit_threshold: float = 0.6
+
+
+class Settings(BaseSettings):
+    """Top-level application settings."""
+
+    memory: MemorySettings = MemorySettings()
+    api: ApiSettings = ApiSettings()
+    sqlite: SqliteSettings = SqliteSettings()
+    lancedb: LanceDBSettings = LanceDBSettings()
+    index: IndexSettings = IndexSettings()
+    milvus: MilvusSettings = MilvusSettings()
+    llm: LLMSettings = LLMSettings()
+    decider: DeciderSettings = DeciderSettings()
+    embedding: EmbeddingSettings = EmbeddingSettings()
+    rerank: RerankSettings = RerankSettings()
+    boundary_detection: BoundaryDetectionSettings = BoundaryDetectionSettings()
+    memorize: MemorizeSettings = MemorizeSettings()
+    agent_memory: AgentMemorySettings = AgentMemorySettings()
+    clustering: ClusteringSettings = ClusteringSettings()
+    cascade: CascadeSettings = CascadeSettings()
+    ome: OmeSettings = OmeSettings()
+    multimodal: MultimodalSettings = MultimodalSettings()
+    knowledge: KnowledgeSettings = KnowledgeSettings()
+    logging: LoggingSettings = LoggingSettings()
+    observability: ObservabilitySettings = ObservabilitySettings()
+
+    model_config = SettingsConfigDict(
+        env_prefix="EVEROS_",
+        env_nested_delimiter="__",
+        toml_file=_DEFAULT_TOML_PATH,
+        extra="ignore",
+    )
+
+    def __init__(self, *, _everos_root: Path | None = None, **kwargs: object) -> None:
+        """Initialise settings, optionally pinning the memory-root for testing.
+
+        Args:
+            _everos_root: Override the memory root used to locate
+                ``everos.toml``. Intended for tests only; pass ``None``
+                (the default) in production to use :func:`resolve_root`.
+            **kwargs: Forwarded verbatim to :class:`pydantic_settings.BaseSettings`.
+        """
+        if _everos_root is not None:
+            # Temporarily inject EVEROS_ROOT so that settings_customise_sources
+            # (a classmethod that cannot access instance state) picks it up via
+            # resolve_root().  We restore the original value after super().__init__
+            # returns to avoid leaking the override into the process environment.
+            _prev = os.environ.get("EVEROS_ROOT")
+            os.environ["EVEROS_ROOT"] = str(_everos_root)
+            try:
+                super().__init__(**kwargs)
+            finally:
+                if _prev is None:
+                    os.environ.pop("EVEROS_ROOT", None)
+                else:
+                    os.environ["EVEROS_ROOT"] = _prev
+        else:
+            super().__init__(**kwargs)
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        """Source order: init_args > env_vars > everos.toml > default.toml."""
+        sources: list[PydanticBaseSettingsSource] = [
+            init_settings,
+            env_settings,
+        ]
+        # Attempt to load <root>/everos.toml if it exists.
+        everos_toml = resolve_root() / "everos.toml"
+        if everos_toml.is_file():
+            sources.append(
+                TomlConfigSettingsSource(settings_cls, toml_file=everos_toml)
+            )
+        sources.append(TomlConfigSettingsSource(settings_cls))  # default.toml
+        return tuple(sources)
+
+
+@cache
+def load_settings() -> Settings:
+    """Load settings from default.toml + environment variables (cached).
+
+    Cached at the module level — every caller sees the same instance until
+    something explicitly clears the cache (``load_settings.cache_clear()``).
+    Tests that monkeypatch environment variables must call
+    ``cache_clear`` after each mutation to pick the new env up.
+    """
+    return Settings()

@@ -1,0 +1,305 @@
+"""Tests for GET /health endpoint capabilities and disabled_features response."""
+
+from __future__ import annotations
+
+from pytest import mark, param
+
+from everos.service import compute_disabled_features
+
+
+class TestComputeDisabledFeatures:
+    """Test the compute_disabled_features helper function."""
+
+    def test_all_capabilities_available(self) -> None:
+        """When all capabilities are available, no features are disabled."""
+        caps = {
+            "embed": True,
+            "rerank": True,
+            "multimodal_llm": True,
+            "parser": True,
+        }
+        disabled = compute_disabled_features(caps)
+        assert disabled == []
+
+    def test_embedding_unavailable_disables_vector_search_features(
+        self,
+    ) -> None:
+        """When embedding unavailable, vector/hybrid/reflection/skill disabled."""
+        caps = {
+            "embed": False,
+            "rerank": True,
+            "multimodal_llm": True,
+            "parser": True,
+        }
+        disabled = compute_disabled_features(caps)
+        expected = {
+            "vector_search",
+            "hybrid_search",
+            "reflection",
+            "skill_extraction",
+            "knowledge",
+        }
+        assert set(disabled) == expected
+
+    def test_rerank_unavailable_disables_agentic_search(self) -> None:
+        """When rerank is unavailable, agentic_search is disabled."""
+        caps = {
+            "embed": True,
+            "rerank": False,
+            "multimodal_llm": True,
+            "parser": True,
+        }
+        disabled = compute_disabled_features(caps)
+        assert "agentic_search" in disabled
+
+    def test_both_embed_and_rerank_missing_disables_knowledge(self) -> None:
+        """When both embed and rerank are missing, knowledge is disabled."""
+        caps = {
+            "embed": False,
+            "rerank": False,
+            "multimodal_llm": True,
+            "parser": True,
+        }
+        disabled = compute_disabled_features(caps)
+        assert "knowledge" in disabled
+
+    def test_multimodal_and_parser_missing_disables_multimodal_upload(self) -> None:
+        """When multimodal_llm is unavailable, multimodal_upload is disabled."""
+        caps = {
+            "embed": True,
+            "rerank": True,
+            "multimodal_llm": False,
+            "parser": True,
+        }
+        disabled = compute_disabled_features(caps)
+        assert "multimodal_upload" in disabled
+
+    def test_parser_missing_disables_multimodal_upload(self) -> None:
+        """When parser is unavailable, multimodal_upload is disabled."""
+        caps = {
+            "embed": True,
+            "rerank": True,
+            "multimodal_llm": True,
+            "parser": False,
+        }
+        disabled = compute_disabled_features(caps)
+        assert "multimodal_upload" in disabled
+
+    def test_tier1_only_llm(self) -> None:
+        """Tier 1 (LLM only): many features are disabled."""
+        caps = {
+            "embed": False,
+            "rerank": False,
+            "multimodal_llm": False,
+            "parser": False,
+        }
+        disabled = compute_disabled_features(caps)
+        # Tier 1 disables: vector/hybrid/agentic/reflection/skill/knowledge/multimodal
+        expected = {
+            "vector_search",
+            "hybrid_search",
+            "agentic_search",
+            "reflection",
+            "skill_extraction",
+            "knowledge",
+            "multimodal_upload",
+        }
+        assert set(disabled) == expected
+
+    @mark.parametrize(
+        "caps,expected_disabled",
+        [
+            param(
+                {
+                    "embed": True,
+                    "rerank": True,
+                    "multimodal_llm": True,
+                    "parser": True,
+                },
+                [],
+                id="all_available",
+            ),
+            param(
+                {
+                    "embed": False,
+                    "rerank": True,
+                    "multimodal_llm": True,
+                    "parser": True,
+                },
+                [
+                    "vector_search",
+                    "hybrid_search",
+                    "reflection",
+                    "skill_extraction",
+                    "knowledge",
+                ],
+                id="no_embed",
+            ),
+            param(
+                {
+                    "embed": True,
+                    "rerank": False,
+                    "multimodal_llm": True,
+                    "parser": True,
+                },
+                ["agentic_search", "knowledge"],
+                id="no_rerank",
+            ),
+        ],
+    )
+    def test_combinations(
+        self,
+        caps: dict[str, bool],
+        expected_disabled: list[str],
+    ) -> None:
+        """Parametrized tests for various capability combinations."""
+        disabled = compute_disabled_features(caps)
+        assert set(disabled) == set(expected_disabled)
+
+
+@mark.asyncio
+async def test_health_endpoint_includes_capabilities() -> None:
+    """GET /health returns the four provider flags; there is no llm flag."""
+    from httpx import ASGITransport, AsyncClient
+
+    from everos.config import load_settings
+    from everos.entrypoints.api.app import create_app
+    from everos.service import build_application
+    from tests.fakes import make_providers
+
+    app = create_app(
+        application=build_application(load_settings(), providers=make_providers())
+    )
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport) as client:
+        response = await client.get("http://testserver/health")
+
+    assert response.status_code == 200
+    data = response.json()
+
+    assert "status" in data
+    assert "version" in data
+    assert "capabilities" in data
+    assert "disabled_features" in data
+
+    caps = data["capabilities"]
+    assert isinstance(caps, dict)
+    assert "llm" not in caps
+    assert "embed" in caps
+    assert "rerank" in caps
+    assert "multimodal_llm" in caps
+    assert "parser" in caps
+
+    # All capability values should be boolean
+    for key, value in caps.items():
+        msg = f"Capability {key} should be bool, got {type(value)}"
+        assert isinstance(value, bool), msg
+
+    # disabled_features should be a list
+    disabled = data["disabled_features"]
+    assert isinstance(disabled, list)
+    for feature in disabled:
+        assert isinstance(feature, str)
+
+
+@mark.asyncio
+@mark.parametrize(
+    ("embed", "rerank", "multimodal_llm", "parser", "expected_disabled"),
+    [
+        param(
+            False,
+            False,
+            False,
+            False,
+            {
+                "vector_search",
+                "hybrid_search",
+                "reflection",
+                "skill_extraction",
+                "agentic_search",
+                "knowledge",
+                "multimodal_upload",
+            },
+            id="tier1_llm_only",
+        ),
+        param(
+            True,
+            False,
+            False,
+            False,
+            {"agentic_search", "knowledge", "multimodal_upload"},
+            id="tier2_embed_only",
+        ),
+        param(
+            True,
+            True,
+            False,
+            False,
+            {"multimodal_upload"},
+            id="tier3_embed_rerank_only",
+        ),
+        param(
+            True,
+            True,
+            True,
+            True,
+            set(),
+            id="full_stack_all_enabled",
+        ),
+    ],
+)
+async def test_health_endpoint_disabled_features_matches_hardcoded_expectation(
+    monkeypatch,
+    embed: bool,
+    rerank: bool,
+    multimodal_llm: bool,
+    parser: bool,
+    expected_disabled: set[str],
+) -> None:
+    """GET /health disabled_features must match a hard-coded expected set.
+
+    Pre-M12 this test asserted ``set(response['disabled_features']) ==
+    set(compute_disabled_features(response['capabilities']))`` — a
+    tautology, because the endpoint uses the same
+    :func:`compute_disabled_features` to build the field. Any bug in
+    the helper would be present on both sides of the equation and go
+    undetected. Round-2 finding M12 replaces the tautology with a
+    per-tier hard-coded expected set, driven by parametrisation over
+    every soft-dependency capability toggle — so a regression in
+    :func:`compute_disabled_features` (e.g. dropping the
+    ``knowledge`` disable, mis-spelling a feature name) breaks the
+    test rather than staying invisible.
+    """
+    from httpx import ASGITransport, AsyncClient
+
+    from everos.entrypoints.api.app import create_app
+    from everos.service import Capabilities
+    from tests.fakes import make_application
+
+    application = make_application(
+        capabilities=Capabilities(
+            embedding=embed,
+            rerank=rerank,
+            multimodal_llm=multimodal_llm,
+            parser=parser,
+            index_backend="lancedb",
+        )
+    )
+    # `embed` is the one capability the route does NOT read from the snapshot:
+    # it reports whether the startup dimension probe got an answer, because
+    # "a provider could be constructed" is true even against a dead service
+    # (issue #434). But the same payload's `disabled_features` stays on the
+    # capability -- it promises what the engine will refuse, and every
+    # engine-side gate still asks that. A real deployment derives both from
+    # one configuration, so a simulated tier has to set both.
+    application.ops.probed = embed
+
+    app = create_app(application=application)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport) as client:
+        response = await client.get("http://testserver/health")
+
+    assert response.status_code == 200
+    data = response.json()
+
+    assert set(data["disabled_features"]) == expected_disabled

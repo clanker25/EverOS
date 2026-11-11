@@ -1,0 +1,12 @@
+{
+  "operations": [
+    {
+      "action": "update",
+      "index": 4,
+      "data": {
+        "confidence": 1.9
+      }
+    }
+  ],
+  "update_note": "Raised the confidence of a skill the prompt never showed."
+}

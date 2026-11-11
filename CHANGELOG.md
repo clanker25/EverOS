@@ -1,0 +1,2243 @@
+# Changelog
+
+All notable changes to **EverOS** are documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [1.6.0] - 2026-11-11
+
+EverOS 1.6.0 adds memory deletion aligned with the Cloud API, including
+owner-scoped deletion by ID, and improves recovery when writes, background
+tasks, and file updates overlap. It also unifies application assembly across
+the server and CLI through `MemoryService`, `KnowledgeService`, and
+`OpsService`.
+
+This release adds safeguards for large search workloads and keeps unused
+vectors out of returned query results. See the upgrade notes below for
+configuration and Python API changes.
+
+### Added
+
+- **`POST /api/v2/memory/delete`** ([#483](https://github.com/EverMind-AI/EverOS/issues/483)):
+  delete by `user_id` / `agent_id`, by `session_id`, or one owner's session;
+  answers `{"filters": [...], "count": N}`. A session still being memorized
+  answers `503 SESSION_BUSY` and nothing is deleted. everos-mcp's
+  `forget_session` now works against a self-hosted server.
+- **`POST /api/v2/memory/delete_by_ids`**: delete episodes by memory id, with
+  what Reflection merged into them, their atomic facts and their cluster
+  membership. The optional `user_id` restricts deletion to that owner;
+  `deleted` reports the number actually removed, excluding missing,
+  duplicate, or other-owner ids.
+- Configuration: `[memorize] delete_wait_seconds` (default `10`),
+  `[cascade] delete_fence_warn_entries` (default `100000`).
+- Metrics: `everos_lock_wait_seconds` / `everos_lock_hold_seconds` (by lock
+  kind), `everos_lock_table_entries`, `everos_memory_delete_fence_entries` /
+  `_runs`.
+
+- **An optional correctness gate for agent cases** (`[agent_memory]
+  case_gate_enabled`, default `false`). On, the extraction LLM judges
+  whether the work in an agent conversation was completed correctly (one
+  extra call per conversation up to 50k tokens; longer ones are admitted
+  without a call), and only admitted conversations become cases, instead of
+  the complexity and value filters deciding. An admitted case drives skill
+  extraction whatever its quality score. The judge is
+  `everos.component.llm.LLMCaseJudge`.
+- **The log level is configuration** (`[logging] level`, default `"INFO"`).
+  `everos.service.configure_process(settings)` sets up logging, tracing and
+  metrics once per process; `build_application` calls it, and the CLI no
+  longer configures logging itself. `server start --log-level` and
+  `EVEROS_LOG_LEVEL` still override the level for the server, and
+  interactive commands still log `WARNING` (`INFO` with `--verbose`).
+- **One language decision per cell, pinned downstream.** The episode is
+  still written in whatever language the model picks from the conversation;
+  that language is then detected from the episode text by Unicode script
+  (`everos.core.utils.language.detect_output_language`, one of everalgo's
+  `OutputLanguage` values) and carried on the episode and its
+  `EpisodeExtracted` / `ProfileClusterUpdated` events. Atomic facts are
+  extracted in it, and a profile is written in it and then frozen: the
+  first profile extraction that knows the language stores it as
+  `primary_language` in `user.md`, and later extractions keep that value
+  even when an episode arrives in another language (changing it is a manual
+  edit). Episode entries gain an inline `language` field. Both are left out
+  while unknown, so episode logs and `user.md` written before this release
+  read back with no language and extraction falls back to everalgo's own
+  inference. The search index, the API and `/get` are unchanged.
+
+### Changed
+
+- Every markdown write of a memory owner holds that owner's lock and first
+  checks that what it was derived from still exists; a write whose source was
+  deleted is skipped and logged as `memory_write_skipped_source_gone`.
+- User clustering and the Reflection finish embed before taking their locks.
+- A succeeded OME run no longer keeps the triggering event (the conversation
+  text) in `ome.db`; failed and dead-letter runs keep it for diagnosis.
+- `/get` lists an episode Reflection merged from several sessions with
+  `"session_id": null` instead of failing the page.
+- `/add`, `/flush` and `/memory/delete` refuse a `session_id` with leading or
+  trailing whitespace or a control character (`422`). A daily-log file
+  stores it as one trimmed line, so such an id was read back as another one
+  and could not be matched by a session filter or deleted.
+- A SQLite write that waited out `[sqlite] busy_timeout_ms` on another
+  writer's lock answers `503 EXTERNAL_SERVICE_UNAVAILABLE` with the fixed
+  message `"database is busy"` (retryable) instead of an unhandled `500`; the
+  failed statement, without its values, is logged as
+  `sqlite_lock_wait_timed_out`. A queued `/add` failing that way records
+  `last_error` `"StorageError: database is busy"`.
+- Server log tracebacks are plain text (innermost 15 frames, no locals)
+  instead of rich's syntax-highlighted rendering, which blocked the event
+  loop for seconds per exception on a loaded host. CLI and TUI logs share
+  the same configuration.
+
+- **Internal module layout: one convention across `infra` and `service`.**
+  Every `infra` subpackage now keeps its implementation in private
+  directories behind its `__init__` facade (`cascade/_projections`,
+  `cascade/_worker`, `markdown/_base|_mds|_readers|_writers`,
+  `sqlite/_base|_repos|_tables`, `lancedb/_base|_repos`, matching `ome`);
+  the backfill steps live in `service/ops/backfill/`; the index port
+  package no longer re-exports the record tables, which are imported from
+  `everos.infra.persistence.records`. Public facades are unchanged, and
+  `import-linter` now forbids the outer layers from reaching into
+  `everos.infra.cascade.**` as it already did for `persistence`. Logger
+  names follow module paths, so a log filter on a renamed module (for
+  example `everos.infra.persistence.sqlite.repos.*`) needs the `_repos`
+  spelling.
+- **`IndexRepository.find_by_owner` is removed.** It read rows by
+  `owner_id` across every `(app_id, project_id)` scope; nothing called it
+  (#480). Scoped reads go through `find_where` with an explicit filter or
+  `find_by_owner_entries`.
+- **The cascade and OME engine switches are settings.** `[cascade]
+  enabled` and `[cascade] watcher_enabled` replace the
+  `EVEROS_DISABLE_CASCADE` and `EVEROS_DISABLE_CASCADE_WATCHER` environment
+  variables, and the new `[ome]` section's `max_concurrent_runs` and
+  `run_timeout_seconds` (`0` disables the ceiling) replace
+  `EVEROS_OME_MAX_CONCURRENT_RUNS` and `EVEROS_OME_RUN_TIMEOUT_SECONDS`.
+  The old variables are no longer read; set the keys in `everos.toml`
+  instead.
+- **Building the application requires `[llm]`.** `build_providers` (and so
+  `build_application`) raises `LLMNotConfiguredError` when `[llm]` has no
+  `api_key` or `base_url`, instead of building without an extraction LLM
+  and leaving the server's start to refuse. The server still refuses to
+  start, now at assembly; every `everos cascade …` command builds the same
+  application, so those commands also need a configured `[llm]` and exit
+  with code 3 and the toml section to edit when it is missing. Python
+  callers that passed `Providers(llm=None, …)` must pass a client.
+- **`GET /health` no longer reports `capabilities.llm`.** It was always
+  `true` -- a server without an extraction LLM does not start -- so it is
+  removed; clients that read it should drop the check. `Capabilities.llm` /
+  `.decider` and `ProviderStatus.llm` are removed from `everos.service` for
+  the same reason.
+- **`everos.component.config` is renamed to `everos.component.yaml_loader`.**
+  The package name no longer collides with `everos.config`. Update imports to
+  `from everos.component.yaml_loader import YamlConfigLoader`; the class name
+  is unchanged.
+- **`MemoryService` write use cases are `add` and `flush`.**
+  `MemoryService.submit_add` / `submit_flush` are now `add` / `flush`, the
+  names the HTTP API uses; the inline `memorize()` / `flush()` steps are
+  private. Python callers of the facade update the two names; HTTP clients
+  are unaffected.
+- **Local parser input handling lives in the parser component.** Application
+  assembly supplies the raw-file builder to ingestion, and ingestion no longer
+  falls back to a built-in one. `everos.memory.extract.parser.mapping` is
+  removed; import `build_raw_file`, `read_file_uri` and `to_raw_file` from
+  `everos.component.parser`; `build_raw_file` and `read_file_uri` now require
+  a `settings_source` instead of falling back to `load_settings`. URI checks,
+  allowlist rules, size checks and error behavior are preserved. The `file_uri_hydrated` log event is now emitted by
+  the `everos.component.parser.input` logger; update log filters that matched
+  the old module name.
+- **Multi-round search receives explicit configuration readers.** Application
+  assembly supplies tuning and trace-path readers, and `SearchManager`,
+  `LLMRoundDecider` and `search_episodes_llm_multiround` now require them
+  instead of falling back to a built-in reader. The existing settings cache,
+  legacy environment overrides and per-call read timing are preserved. Retry
+  defaults and execution rules are unchanged by this refactor. The
+  `llm_multiround_bad_env_override` log event is now emitted by the
+  `everos.config.search_runtime` logger; update log filters that matched the
+  old module name.
+- **Reflection delegates file grouping to the Markdown stores.** Retirement
+  keeps the existing file order, partial-write failure behavior and report
+  counts. The unreleased `EpisodeStore.deprecate` and
+  `AtomicFactStore.deprecate` contracts now accept ordered `entries` and a
+  `replaced_by` ID instead of a per-file replacement mapping.
+- **Index synchronization and vector backfill share embedding rules.**
+  Episode, atomic fact, foresight, agent case, agent skill and knowledge topic
+  projections now use the same source-text and vector-column declarations.
+  Backfill keeps its existing partial-failure recovery and historical text
+  normalization behavior; no data migration is required.
+- **An agent memcell that produces no case now records why.** everalgo
+  0.6 extracts an agent case only from a closed trajectory (a user request
+  through to the assistant's final answer); when boundary detection leaves
+  an unclosed slice -- typically by cutting just before the final answer --
+  that slice yields no case. The extraction outcome is now persisted on the
+  `memcell` row: `case_extracted_at`, `case_skip_reason` (`NULL` exactly
+  when a case was produced; otherwise everalgo's skip reason, or
+  `no_agent_sender`) and `case_skip_detail_json`. Existing `system.db`
+  files gain the three columns automatically at startup.
+- **`everos.service.memorize_queue` is gone.** The `async_mode` queue now
+  lives in the `MemoryService` package; `TaskItem`, `TaskPage`,
+  `QueueHealth` and `TASK_STATUSES` are imported from `everos.service` (or
+  `everos.service.memory`).
+- **Entry points import only the service.** A new import-linter contract
+  (`entrypoints-forbidden`) keeps `everos.entrypoints` off `everos.memory`,
+  `everos.infra`, `everos.component` and `everalgo`; request / response
+  DTOs (`GetRequest`, `SearchRequest`, ...) are re-exported by
+  `everos.service`.
+- **`everos.memory.ports.ClusterStore` speaks in cluster operations.** The
+  port shrinks from eleven methods to seven: `add_member`, `remove_members`
+  and `update_metadata` become one `replace_members(cluster_id, *, removed,
+  added, member_type, centroid, count, last_ts, preview)`, which swaps the
+  members and restamps the cluster in a single SQLite transaction (before,
+  a crash between the three calls could leave the membership and the
+  snapshot disagreeing). `list_ids_and_member_counts` and `count` are gone:
+  read `len(cluster.members)` from `list_for_owner`. Custom `ClusterStore`
+  implementations need the same change.
+- **`everos.entrypoints.api.utils` is now `everos.entrypoints.api.dependencies`**
+  (internal): it holds the FastAPI request dependencies (`application`,
+  `extract_request_id`), named as FastAPI's project layout names them.
+- **`session_lock_timeout_seconds` sits under `[memorize]` in the shipped
+  `default.toml`** (it had landed under `[knowledge.search]`, where it was
+  ignored). The value, and so the behaviour, is unchanged.
+- **Timings are constructor arguments instead of module constants to patch.**
+  `LanceRepoBase` takes `timeouts=LanceTimeouts(...)` (and `sweep_husks=`),
+  `LanceIndexBackend` takes `schemas=`, `CascadeWorker` takes
+  `maintenance_task_timeout_seconds` / `rebuild_conflict_backoffs_seconds` /
+  `loop_restart_backoffs_seconds` / `on_unrecoverable`, `CascadeConfig` gains
+  `drain_idle_limit_seconds`, `memory_root_lock` takes `poll_interval_seconds`,
+  and `MemorizeQueueWorker` takes `stop_grace_seconds` / `mark_retry_seconds`.
+  Every default is the previous constant. The lance husk sweep is public as
+  `remove_empty_index_dirs`.
+- **`everos.service.memory` is a package** (the facade stays importable from
+  the same path). The process-wide session-lock registry
+  (`everos.service._session_lock`) is gone: each `MemoryService` owns its
+  per-session locks.
+- **The operator, upload and queueing rules moved from the HTTP routes and
+  the CLI into the service facades.** `OpsService.health()` assembles the
+  `/health` payload (a failed probe still reads as an unhealthy block, never
+  a 500); `OpsService.list_tasks` validates `status` and caps `page_size` at
+  100; `MemoryService.submit_add` / `submit_flush` decide between running
+  inline and queueing (`Queued` when queued); `KnowledgeService.create_from_upload`
+  / `replace_from_upload` check the size, pick UTF-8 or the parser and
+  extract, and `KnowledgeService.require_search_providers` is the
+  embedding + rerank gate. HTTP status codes and bodies are unchanged.
+  `everos.component.capabilities` is removed; `compute_disabled_features` is
+  exported from `everos.service`.
+- **Backfill is part of `OpsService`.** `everos.service.backfill` is removed.
+  `OpsService.backfill(phase, auto_yes=, presenter=, summary=)` runs one
+  phase or `"all"`, stops on a missing provider, a running server or a
+  declined prompt, and returns a `BackfillOutcome`; each phase's result
+  lands in the caller's `BackfillSummary`. Its collaborators are injected as
+  one `BackfillDeps`, so the service layer no longer imports `infra`.
+  `BackfillPresenter` gains `phase_started(phase)`; `BackfillPhase` is gone
+  (the CLI keeps its own phase copy). The public result types are
+  `VectorsPhaseResult`, `ClustersPhaseResult` and `SkillsPhaseResult`.
+- **`Application` closes its storage whether or not it was started**, and
+  `aclose()` is idempotent; `async with build_application(settings) as app:`
+  closes on exit. The CLI uses it for every command.
+- **`MemoryRootLockedError` (`everos.core.errors`) is what callers catch
+  when another process holds the memory root.** The OME engine's
+  `EngineLockHeldError` is a subclass; `everos.infra.ome.OmeLock` takes the
+  same lock from outside a running engine.
+- **The datetime helpers moved to `everos.core.utils.datetime`.**
+  `everos.component.utils` is removed; import `get_utc_now`,
+  `to_display_tz`, `UtcDatetime` and the other two-zone helpers from
+  `everos.core.utils.datetime` instead. They are stateless tools every layer
+  uses, the HTTP and CLI entry points included, so they live with the other
+  cross-cutting runtime code.
+- **The service layer's module-level functions are gone.** `everos.service`
+  no longer exports `memorize`, `search`, `get`, `get_task`, `list_tasks` or
+  the knowledge functions (`create_document`, `search_knowledge`, ...); build
+  an `Application` and call `application.memory.*`, `application.knowledge.*`
+  or `application.ops.*`. `everos.service.memorize`, `.search`, `.get` and
+  the `everos.core.lifespan` / `everos.entrypoints.api.lifespans` packages
+  are removed. `create_app()` takes `settings` or a pre-built `application`
+  instead of `lifespan_providers`.
+- **The process-wide provider accessors are gone.**
+  `everos.component.llm.get_llm_client` / `get_decider_llm_client` /
+  `get_multimodal_llm_client`, `everos.component.embedding.get_embedding_capability`
+  and `EmbeddingCapability`, `everos.component.rerank.get_rerank_capability` and
+  `RerankCapability`, and the `everos.component.multimodal` package are removed.
+  Take providers from `everos.service.build_providers(settings)` (a provider
+  that is not configured is `None`) or build one with the component factories;
+  `resolve_decider_config` now requires its `settings` argument.
+  `everos.component.parser.aparse_file` takes the multimodal LLM as `llm=`.
+  `missing_config_error` moved from `everos.component.utils.config_hints` to
+  `everos.config`. `set_metrics_registry` / `reset_metrics_registry` are
+  replaced by `configure_metrics(registry)`.
+- **The storage singletons are gone.** The module-level repository
+  instances (`episode_repo`, `atomic_fact_repo`, ..., `md_change_state_repo`,
+  `cluster_repo`, `knowledge_document_repo`, ...), the engine / connection
+  accessors (`everos.infra.persistence.sqlite.get_engine` /
+  `get_session_factory` / `dispose_engine`,
+  `everos.infra.persistence.lancedb.get_table` / `get_connection` /
+  `dispose_connection`, the Milvus `get_client` / `dispose_connection`) and the
+  index facade functions (`startup`, `shutdown`, `ensure_business_indexes`,
+  `drop_business_tables`, `read_embedding_model`, ...) are removed, together
+  with `everos.infra.persistence.index.router` and the `lancedb.indexes` /
+  `milvus.indexes` modules. Storage is now a set of objects built over one
+  memory root: `SqliteDatabase` + `SqliteRepos.over(database)`,
+  `LanceDbConnection` / `MilvusConnection`, and the `DerivedIndex` returned by
+  `everos.infra.persistence.factories.build_derived_index(settings, root)`,
+  whose `repositories` replace the old index instances. The SQLite repository
+  classes are public (`ClusterRepo`, `MdChangeStateRepo`, ...; the knowledge
+  topic row repository is `KnowledgeTopicRowRepo`) and take their session
+  factory in the constructor. `CascadeOrchestrator`, `CascadeAdmin`,
+  `CascadeScanner`, `CascadeWatcher`, `CascadeWorker`, `HandlerDeps` and
+  `KnowledgeService` take the storage they use as constructor arguments, and
+  `KindSpec.index_repo` is removed (a handler's repository comes from
+  `HandlerDeps.index`).
+- **One embedding provider per process.** The cascade handlers and the startup
+  provenance check use the application's embedding provider instead of
+  building a second one, so `[embedding] max_concurrent` is no longer doubled
+  in practice.
+- **`OMEConfig.jobstore_path` is required.** The engine no longer resolves the
+  memory root on its own; the application passes `<root>/.index/sqlite/ome.db`.
+- **Backfill logs under `everos.service.backfill`** (was
+  `everos.memory.cascade._backfill`); update log filters keyed on the old name.
+- **A merged episode with an empty subject no longer writes an empty
+  `### Subject` section** to its markdown.
+- **A profile JSON column that does not decode to a list reads as empty**
+  instead of being passed through as-is.
+- **Reflection runs in two steps.** `reflect_episodes` writes the merged
+  episode; the new `finish_reflection` strategy deprecates the source episodes
+  once the merged episode's atomic facts exist. If fact extraction for the
+  merged episode dead-letters, the sources now stay searchable (they used to
+  be deprecated anyway), and the old 120 s wait is gone.
+- **`UserPipelineStarted` is published after its cell's episode is extracted**
+  (it used to be published before any cell ran). Its only subscriber,
+  `extract_foresight`, ships disabled.
+- **Prompt slots are replaced by custom instructions.**
+  `config/prompt_slots/*.yaml` (`enabled` + `template`, a whole replacement
+  prompt) and `everos.memory.prompt_slots.PromptLoader` are removed. The
+  user-memory operators now take `custom_instructions=`, appended after
+  their bundled rules: configure them in
+  `config/custom_instructions/<operator>.yaml` (`enabled` + `instructions`)
+  for `boundary_detection`, `episode_extract`, `profile_extract` and
+  `reflect`, read by `everos.memory.custom_instructions.CustomInstructions`.
+  See [docs/custom_instructions.md](docs/custom_instructions.md).
+- **Boundary detection is a domain object.** `everos.service._boundary` is
+  replaced by `everos.memory.extract.boundary.BoundaryDetection`, which
+  `MemoryService` receives instead of `llm` / `prompt_loader`. Both modes now
+  run `everalgo.boundary.adetect_boundaries` (agent mode keeps tool rows in
+  the cells and now honours `[boundary_detection]` hard limits too). When
+  the model judges the trailing segment of a non-final call complete
+  (`tail_complete`), that segment is closed into a last cell and extracted
+  at once; a segment it judges open, or one no model judged, waits in the
+  buffer for the next batch or `/flush`.
+- **An unusable model reply is `everalgo.llm.LLMOutputError`**, no longer a
+  `ValueError`. Boundary detection and episode extraction try it three times
+  (`everos.memory.extract.llm_retry`, the one host-side retry), with no
+  backoff (episode extraction used to sleep 1 s and 2 s between attempts).
+  The session quarantine counts calls that end in `LLMOutputError` (after
+  its retries) or in a `ValueError` -- a message everalgo refuses
+  (`InvalidInputError`) or a row that maps to no conversation item, such as
+  an orphan tool result -- which is never retried; other errors propagate
+  uncounted.
+- **`Episode.summary` is required** (everalgo 0.9 writes one for every
+  episode and every merge) and `Episode.subject` defaults to `""`; episodes
+  indexed before either existed read back as `""`. `AtomicFact.fact` is
+  renamed `AtomicFact.content`. `Profile.explicit_info` /
+  `implicit_traits` hold `ExplicitInfoItem` / `ImplicitTraitItem` (same
+  shape as everalgo's); a profile item stored as a bare sentence reads back
+  as an item with only its `description`. A stored item with no
+  `description` is dropped when the profile is read (`/get`, `/search`'s
+  profile, the next profile update), with a `profile_entry_dropped`
+  warning; writing a profile stays strict. `/get` and `/search` return every
+  profile item with all four keys (`description`, `category` / `trait`,
+  `evidence` / `basis`, `observed_at`), the ones a stored item lacks as
+  `null` -- an additive change.
+- **Agent memory says why it stayed empty.** A memcell that yields no agent
+  case logs `agent_case_skipped` with everalgo's `reason` (for example
+  `too_few_tool_rounds`, `filter_rejected`) and its `detail`; a skill run
+  logs `agent_skill_skipped` for a case below the quality floor and
+  `agent_skill_op_dropped` for each operation the model proposed that was
+  dropped. The case quality floor before skill clustering is everalgo's
+  `should_extract_skill` instead of a copy of its threshold.
+  `AgentCase.from_algo` moved to `everos.memory.mappers.agent_case`.
+- **The multi-round retrieval decider speaks the everalgo LLM contract.**
+  `method="llm_multiround"` asks its decider with
+  `achat(..., response_format=...)`, so a reply must be the
+  `{"core": [<int>...], "next_queries": [<str>...]}` object exactly (the
+  provider retries an invalid one); a reply with prose around the JSON or
+  string indices is no longer accepted, and fails the attempt instead. The
+  trace field `decider.tokens` is `null` for the prompted decider (token
+  usage is reported by the LLM call observer).
+- **Index searches return domain records.** `memory.ports.IndexHit` (a row
+  read by column name) is replaced by `SearchHit[T]` (its `stored` record and `score`), and
+  knowledge-topic searches return `ScoredKnowledgeTopic`. Recall hands the
+  rank algorithms everalgo `Candidate`s whose `metadata` holds only the
+  fields an algorithm reads, with the stored records alongside
+  (`RecallResult.stored_by_id`); responses are built from those records.
+  An LLM rerank (`enable_llm_rerank=true`) no longer sees index-only columns
+  such as `md_path`, `content_sha256` or the `*_tokens` columns in its
+  candidate JSON. `everos.memory` no longer re-exports the `Algo*` aliases
+  of everalgo's types.
+- **The knowledge service works through two ports.** `KnowledgeService`
+  takes a `KnowledgeStore` (markdown documents, taxonomy, uploaded
+  originals; `MarkdownKnowledgeStore`) and a `KnowledgeCatalog` (the
+  document / topic records; `SqliteKnowledgeCatalog`) instead of a memory
+  root and two repositories. Replacing a document now extracts its topics
+  before touching the old files. `LLMNotConfiguredError` lives in
+  `everos.core.errors` (still importable from `everos.component.llm`).
+- **`everos.service.knowledge` is a package** (the facade and its result
+  types stay importable from the same path). The unused
+  `KnowledgeService.parse_file` method is removed. Error types are no longer
+  reachable through the module: import them from `everos.core.errors`.
+- **`KnowledgeDocument` carries no storage path.** The `md_path` field is
+  removed; the knowledge store finds a document by its id.
+  `KnowledgeStore.delete_document` no longer takes `md_path`,
+  `KnowledgeStore.update_document` returns a `WrittenDocument` (which now
+  also carries `md_path`, the document's `index.md` relative to the memory
+  root), and `KnowledgeCatalog.record_document` takes that `md_path` as a
+  keyword. API responses are unchanged.
+- **A request that needs a model while `[llm]` (or `[multimodal]`) is not
+  configured answers 422 `PROVIDER_NOT_CONFIGURED`** instead of 500
+  `INTERNAL_ERROR`.
+- **Vector backfill's row work moved into the index package.** The vectors
+  phase's row-level events (`cascade_backfill_row_*`,
+  `cascade_backfill_batch_*`, `cascade_backfill_table_*`, ...) are now emitted
+  by the `everos.infra.persistence.index.vector_backfill` logger instead of
+  `everos.service.backfill`; update log filters that matched the old name.
+  `BackfillDeps` takes a `vectors` backfill object in place of its
+  `tokenizer` and `prune_retention` fields.
+- **The vector width is read from `[embedding] dim` once, by the
+  application, and nowhere else.** The index record classes no longer read
+  the configuration while they are imported; they mark their embedding
+  columns (`DenseVector`) without a width, and each backend builds its tables
+  at the width the application hands it (`schema_for(model, dim=...)`,
+  `LanceIndexBackend(connection, dim=...)`, `MilvusIndexBackend(connection,
+  dim=...)`). The startup error "the index record classes were built for
+  dim=... but configuration reports dim=..." can no longer occur, and the CLI
+  no longer pre-scans `--root` before parsing its arguments. A table built at
+  another width is still refused at startup, as schema drift. For code that
+  imports the persistence package: `everos.infra.persistence.records` no
+  longer exports `LanceModel` / `Vector`, `BaseLanceTable` is now
+  `IndexRecord` (a plain pydantic model with no `to_arrow_schema`), and the
+  LanceDB Arrow schema comes from
+  `everos.infra.persistence.lancedb.base.arrow_schema_for`.
+
+- On Linux with glibc, the CLI defaults to two malloc arenas to reduce
+  retained allocator memory. Explicit `MALLOC_ARENA_MAX` or
+  `GLIBC_TUNABLES=glibc.malloc.arena_max=...` settings take precedence;
+  importing EverOS as a library does not change the host's allocation policy.
+- Agentic search falls back to relevance-ranked hybrid recall of 50
+  candidates when its first-round cluster expansion exceeds 1,000 episodes.
+  Smaller expansions keep their existing behavior, and the second round
+  retains its 40-candidate cap. The guard bounds reranking work for unusually
+  large groups; it can change recall in that case and does not cap the
+  initial owner-wide corpus snapshot.
+
+### Removed
+
+- **`everos.infra.ome.testing` is no longer shipped.** `StrategyTestHarness`
+  was a test fixture; it now lives in the repository's own test helpers.
+
+### Fixed
+
+- Keep fresh installs on `watchdog>=4.0.2,<7`, matching the tested event
+  semantics. The lower bound includes the macOS fix required for filtered
+  notifications; watchdog 7.1 can stop recursive Linux notifications under
+  `PYTHONWARNINGS=error` when nested directories are created concurrently.
+- The filesystem watcher subscribes only to changes it handles, excluding
+  file-open/close notifications that could overflow Linux's inotify queue
+  during read-heavy searches and delay markdown indexing.
+- A fresh `uv pip install everos` now resolves the parser dependency without
+  requiring a global prerelease override. The base install pins the same
+  parser version as the tested algorithm packages and the multimodal extra.
+- `/add` and `/flush` no longer leave half-written state when a SQLite write
+  lock times out: boundary detection records the memcells, the session's
+  status and the remaining buffer in one transaction. Before, a timeout at
+  the second or third write left memcells that were never extracted, or
+  buffered messages behind a `500` the caller could not act on.
+- A burst of searches no longer fails with `Too many open files`: LanceDB
+  search queries are capped per process (`[lancedb] max_concurrent_queries`,
+  default `32`; metrics `everos_lancedb_query_wait_seconds`,
+  `everos_lancedb_queries_in_flight`), where one agentic search fanned out to
+  about 28 queries that each opened every data file of a table. The server
+  also raises its open-file soft limit to 8192 at start (capped at the hard
+  limit, never lowered; logged), from Linux's 1024 and macOS's 256.
+- Searches that do not request vectors now omit unused vector columns in
+  the database query, before allocating result buffers or Python objects.
+  Vector search still uses vectors internally, and requests that explicitly
+  need vectors retain them. This reduces temporary allocations and work on
+  the event loop that can delay other requests' SQLite transactions.
+- A second server using the same memory root now refuses startup before
+  opening shared storage or resetting active cascade claims (#545). The
+  existing exclusive lock stays held through storage shutdown.
+
+- **On Windows, reading a memory file no longer fails while another write
+  replaces it.** An `open` that races `os.replace` of the same file can be
+  refused for a moment (`PermissionError`, errno 13). Writes already waited
+  that out; reads did not, so a deletion could fail with
+  `DeletionIncompleteError` (`500`) and a cascade projection could fail
+  permanently. Every markdown read now goes through
+  `MarkdownReader.read_text`, which retries with the writer's budget
+  (about 2.5 s). Other platforms are unaffected.
+
+- **A cluster's `count`, centroid and `last_ts` now include an episode that
+  joined it while Reflection was merging it**
+  ([#563](https://github.com/EverMind-AI/EverOS/issues/563)). Reflection
+  wrote them from the members it read before its LLM call, so the new
+  member stayed in the cluster but was not counted, and the user-profile
+  gate, which sums `count`, undercounted.
+
+- **One empty section no longer fails a daily-log file's whole batch.** The
+  four daily-log handlers send every changed entry's text in one
+  `embed_batch` call, and embedding endpoints reject an empty string inside
+  the input array — text-embeddings-inference answers
+  `400 Input validation error: inputs cannot be empty`. An entry whose
+  embedded section is blank (an `atomic_fact` scaffold the extractor left
+  behind before its sentence was written, a `foresight` with an empty
+  `Foresight`, …) therefore failed the call for the *entire file*, so its
+  other entries — already extracted, already on disk — never reached the
+  index, and the projection failed permanently over content the user never
+  sees. Blank texts are now left out of the request and written with
+  `vector = None`, the same soft-degrade a missing provider produces;
+  `vector_backfill` re-embeds the row once the md carries content.
+
+- **The agentic episode search reranks on the episode text.** Its
+  cross-encoder read `metadata["episode"]`, which the bridge to everalgo's
+  prompt format had already turned into a `{"subject", "content"}` dict, so
+  every passage was that dict's Python repr; it now reads the plain body.
+  `method="agentic"` scores change accordingly (a fix, not a regression).
+- **Agent skill clustering failed on the 2026-10-13 everalgo line.**
+  `trigger_skill_clustering` awaited `cluster_by_llm`, which is now a
+  blocking bridge that refuses to run inside the event loop, so no case was
+  clustered and no skill extracted; it now awaits `acluster_by_llm`.
+
+- **The case→skill bridge matches again.** On HYBRID + LLM-rerank agent
+  searches the bridge looked up skills by the matched cases' index row ids
+  (`<agent_id>_ac_…`), while a skill's `source_case_ids` holds the md-side
+  entry ids (`ac_…`), so no skill was ever bridged in (#478). The bridge is
+  now keyed by entry id, and `SearchAgentCaseItem` exposes `entry_id` so a
+  client can join cases to skills the same way.
+- **The first agent `/add` no longer downloads tiktoken's encoding.** The
+  algorithm library counts tokens with `o200k_base`, which tiktoken fetches
+  on first use; a fresh deployment paid for that download inside the first
+  agent write and answered a generic 500 when it failed (#277). The server
+  now warms the encoding at startup, before any storage is opened, and a
+  host that cannot load it fails to start with `TokenizerAssetError` naming
+  the cause and the `TIKTOKEN_CACHE_DIR` pre-cache option.
+- **OME crash recovery resumes every run of the previous process.** It
+  used to skip RUNNING rows younger than 30 minutes on the theory that
+  APScheduler might still own them; it never does (a one-shot job leaves
+  the jobstore when it is submitted), so a run cut short by a restart
+  inside that window was lost for good (#540). The engine holds the
+  jobstore lock before it recovers, so every RUNNING row is a crash:
+  all of them are marked CRASHED and re-enqueued.
+  `OMEConfig.crash_recovery_timeout_seconds` is gone; it was not a
+  user-facing setting.
+- **`radius` is a pre-fusion cosine floor on every vector route.** It was
+  applied to the dense pool of `vector` and `hybrid` searches but also
+  passed into the ranker's input, which never read it, and the `agentic`
+  routes ignored it entirely (#394). The dead ranker field is gone and
+  the agentic dense recalls (cases, skills, episode facts) now apply the
+  same floor; the API reference states the semantics.
+- **A file restored with its old mtime is indexed again.** When the
+  cascade worker found an enqueued file gone it folded the row into a
+  deletion but left it saying `done / added`, so a scan that later saw
+  the file back with the same mtime took it for indexed (#541). The
+  worker now records the applied change (`deleted`), and the reconciler
+  re-emits a present file whose row says `deleted` whatever its mtime.
+
+- Background tasks waiting for a partition lock release their OME
+  execution slot and reclaim it before entering the protected work. A
+  backlog for one owner therefore no longer consumes every execution slot
+  while other owners wait. Active run records remain recoverable even when
+  the bounded completed-run history is full.
+
+### Known limitations
+
+- Profile extraction can miss a newly saved conversation if it runs before the
+  asynchronous episode index catches up. The conversation and extracted memories
+  remain searchable; a later conversation may refresh the profile. This also
+  exists in 1.5.1 and is deferred to 1.6.1.
+- Agent case and skill extraction can overstate an unverified outcome as
+  successful. One smoke-test trajectory exhibited this with the default
+  correctness gate disabled. Review generated procedural memories against their
+  source evidence.
+
+### Upgrade
+
+One command, then a restart:
+
+```bash
+pip install --upgrade everos
+# With uv, allow the pinned pre-release algorithm dependencies:
+uv pip install --upgrade --prerelease=allow everos
+```
+
+(`'everos[multimodal]'` if that extra was installed.) The everalgo packages
+are pinned exactly, so they move to the new contract line with it. Pip resolves
+these exact pins without `--pre`; uv needs `--prerelease=allow`. The first start
+after upgrading migrates `system.db` on its own (see below); Markdown, the index and the OME jobstore are untouched.
+
+Four things a running deployment may have to change by hand; each is also
+described under *Changed* above:
+
+| If you | Then |
+|---|---|
+| set `EVEROS_DISABLE_CASCADE`, `EVEROS_DISABLE_CASCADE_WATCHER`, `EVEROS_OME_MAX_CONCURRENT_RUNS` or `EVEROS_OME_RUN_TIMEOUT_SECONDS` | move the values to `[cascade] enabled` / `watcher_enabled` and `[ome] max_concurrent_runs` / `run_timeout_seconds` in `everos.toml`; the variables are no longer read, so an unmoved `EVEROS_DISABLE_CASCADE` silently turns the cascade back on |
+| run `everos cascade …` on a root with no `[llm]` section | add `[llm]`; building the application now requires it, and the command exits 3 with the file to edit |
+| read `capabilities.llm` from `GET /health` | read `status` or `cascade.healthy` instead; the field is gone |
+| replaced a prompt template through the old prompt slots | move the requirements your template added to `config/custom_instructions/<operator>.yaml` (details below); the template itself is no longer loaded |
+
+Extraction output changes with the everalgo line: episodes, facts and
+profiles are produced by the new prompts, and a profile's language is
+frozen from its first extraction after the upgrade. No action is needed;
+a different style in new entries is expected, not a fault.
+
+Code that imports `everos.service.memorize` / `search` / `get` or calls
+`create_app(lifespan_providers=...)` must switch to `build_application` and
+the facades.
+
+A deployment that customised a prompt slot must move it: keep only the
+requirements the custom template added on top of the default prompt and put
+them in `config/custom_instructions/<operator>.yaml` as `instructions:`
+(the bundled prompt itself can no longer be replaced). Markdown and the
+index schema are unchanged. The SQLite `memcell` table gains three nullable
+columns (`case_extracted_at`, `case_skip_reason`, `case_skip_detail_json`);
+the first start after upgrading adds them to an existing `system.db` on its
+own (logged as `sqlite_column_added`), so there is nothing to run by hand.
+
+This release pins the everalgo packages to one contract line, six of them
+release candidates: `everalgo-core 0.6.0`, `everalgo-boundary 0.4.1`,
+`everalgo-user-memory 0.9.0rc4`, `everalgo-agent-memory 0.6.0rc3`,
+`everalgo-rank 0.5.0rc3`, `everalgo-knowledge 0.3.0rc2`,
+`everalgo-clustering 0.3.0rc2` and `everalgo-parser 0.3.0rc2` (also required
+by knowledge ingestion in a base installation). The pins are exact (`==`), so `pip install
+everos` resolves them without any pre-release flag; upgrade them together,
+never one at a time.
+
+## [1.5.1] - 2026-10-22
+
+**Hybrid and vector search keep up with 10 requests a second out of the box.**
+Each of those searches embeds its query first, and the slots reserved for
+those calls were the limit: with 4 of them and a remote embedding endpoint
+answering in about 0.45 s, search topped out near 9 requests a second and a
+steady 10 queued without bound. The default is now 16, which held the same
+load at a p50 of 0.42 s and a p95 of 1.45 s.
+
+### Changed
+
+- **`[embedding].query_max_concurrent` defaults to 16 instead of 4.** Every
+  hybrid or vector search makes one query embedding call, and the budget
+  reserved for those calls bounded search throughput: with a remote
+  endpoint answering in about 0.45 s, 4 slots capped hybrid search near 9
+  requests/s, so a steady 10 requests/s queued without bound (10,020
+  indexed entries, 5 minutes: p50 64 s, p95 101 s). At 16 the same load
+  held p50 0.42 s, p95 1.45 s, p99 2.11 s, all 3,000 requests served at
+  9.99/s. In-flight requests to the endpoint can now reach
+  `max_concurrent + 16`; set it lower if the endpoint is rate-limited.
+
+### Upgrade
+
+Nothing to migrate. One thing to check: requests in flight to the embedding
+endpoint can now reach `max_concurrent + 16` (26 with the shipped values)
+instead of 14. If your endpoint is rate-limited or a small self-hosted model,
+set `[embedding] query_max_concurrent` (or `EVEROS_EMBEDDING__QUERY_MAX_CONCURRENT`)
+back to what it can take. Roughly, the searches per second it can serve is
+this value divided by the endpoint's per-call latency.
+
+## [1.5.0] - 2026-10-21
+
+**`/add` no longer has to wait for extraction, and an index can no longer be
+wrong without saying so.** A client can hand a batch to `/add` with
+`async_mode` and get a `202` back in milliseconds, while a durable in-process
+queue runs extraction in session order; the field, the response body and the
+task-status paths match EverOS Cloud, so one client works against both. Vector
+columns now follow `[embedding] dim` instead of a hardcoded 1024, startup
+refuses an index the configured model cannot have produced instead of
+accepting writes that are truncated or searches that quietly return nothing,
+and an emptied index is reported instead of looking healthy. The rest is
+reliability: OME writes no longer starve one another on Windows, a session
+lock timeout no longer strands a memcell without its episode, a message the
+model can never segment no longer blocks its session, resolving a cluster's
+members no longer reads two embedding vectors per member, and a dozen smaller
+faults found by property-based tests are fixed.
+
+### Added
+
+- **`async_mode` on `/add`: accept now, extract in the background.** A request with `async_mode: true` is written to a durable
+  SQLite queue (`memorize_inbox`) and answered with `202 Accepted`; an
+  in-process worker then runs the unchanged memorize pipeline for each
+  batch, per session in arrival order and several sessions at a time
+  (`max_concurrency`, default 4), so a session's batches and its flush
+  never overtake each other and one slow session does not hold up the
+  others. A synchronous call on a session that still has
+  queued batches is queued too, for the same reason; `/flush` has no
+  `async_mode` of its own and queues only behind such a backlog. The queue is bounded
+  (`413 PAYLOAD_TOO_LARGE`, `429 QUEUE_SATURATED`), a batch whose delivery
+  fails is marked `failed` and skipped (no automatic retry by default: the
+  pipeline is not atomic, so a re-run is not a clean retry), and every
+  row is deleted seven days after it was accepted. `GET /api/v2/tasks/{task_id}`
+  reports one request's outcome and `GET /api/v2/tasks` lists them (filter by
+  `session_id` / `status`, paged). The field name, the `202` body, the task
+  paths and the status vocabulary match the EverOS Cloud gateway. Replays
+  after a crash are bounded (`max_replays`, default 3), the delivery loop
+  relaunches itself if it ever dies, and `GET /health` reports the queue
+  (`memorize_queue` block: loop alive, backlog, failed, restarts). Configured under
+  `[memorize.async_queue]`; `enabled = false` stops accepting new async
+  work while rows accepted earlier are still delivered. Synchronous calls
+  without a backlog are unchanged.
+
+- **`[embedding] dim` sets the width of every vector column.** It used to be
+  hardcoded at 1024, so a model of any other width could not be used: a
+  narrower one failed every write, a wider one was truncated without saying
+  so. `dim` now drives the schema, and startup checks the configured model
+  against it. (#434)
+
+- **`cascade status` and `/health` tell an emptied index apart from a healthy
+  one.** Deleting `.index/lancedb` used to leave a store that reported perfect
+  health: the ledger lives in `.index/sqlite` and survives the delete, so every
+  file stayed `done`, the scanner enqueued nothing, `cascade status` showed
+  `done: 106` with `lag: 0`, and `/health` reported zero failures — while
+  search returned nothing. Startup now counts rows per business table and
+  compares them against the ledger. `cascade status` prints a live count per
+  table and warns when every one of them is empty; `/health` carries the
+  startup snapshot in `cascade.index_rows` and `cascade.index_emptied`.
+  Reported, not enforced: `healthy` does not flip, because these are startup
+  counts and a signal that cannot clear until the next restart is worse than a
+  number an operator can read. A fresh root, a queue still draining, and a root
+  whose markdown was all deleted are each quiet. Recovery is `everos cascade
+  rebuild`; markdown is the source of truth and is never touched. (#501, #522)
+
+### Changed
+
+- **Startup refuses an index the configured embedding cannot have produced.**
+  Two cases stop a start that used to proceed and fail later: the model
+  returns fewer dimensions than `dim` (nothing could ever be stored), and the
+  index records a *different* model than the one configured (distances
+  between vectors from two models are meaningless, and searches just return
+  nothing useful). Both name the values involved and point at `everos cascade
+  rebuild`; the CLI exits 3 without a traceback. Deployments with no embedding
+  configured (keyword-only, an empty `api_key`) are unaffected — the check is
+  skipped whole.
+
+- **An index records which embedding model built it.** LanceDB keeps it in the
+  `episode` table's `vector` column metadata, Milvus as a collection property.
+  An index that predates this release has no such record: the first start
+  after upgrading writes one in place, without touching a row or a column
+  type, and logs that it did. `everos cascade rebuild` records the model it
+  rebuilt with.
+
+- **`/health` `capabilities.embed` reports the startup probe, not whether a
+  provider can be constructed.** It used to be true whenever `model`,
+  `api_key` and `base_url` were set, including against a dead endpoint. It is
+  now the result of the one embedding call made at startup, and does not flip
+  back without a restart.
+
+- **Every `everos` command makes one embedding call at startup** to measure
+  the model's real output width, with a 5-second budget and no retries. If it
+  fails, the start continues with a warning and the width check is skipped —
+  the model-change check does not depend on it.
+
+### Fixed
+
+- **OME: concurrent run-record writes could starve one another until the
+  busy timeout.** Every store write opened its own connection and left the
+  waiting to SQLite's busy handler, which sleeps and retries, so under
+  several writers a late arrival could keep taking the write lock ahead of
+  an early one. On Windows, where a commit costs 30-80 ms, a writer starved
+  that way hit the 5 s timeout and failed with `database is locked`
+  (measured on CI: 16 writers, p99 3.8 s, one failure in 30 s), which
+  silently drops the run when it lands on the RUNNING insert and leaves the
+  row RUNNING until a restart when it lands on a status update. Writers now
+  queue on an in-process lock that nobody overtakes before touching the
+  file. The engine also keeps one connection open for its lifetime: with
+  a connection per statement, every close used to be the last close, which
+  checkpoints and deletes the WAL files under an exclusive lock and on
+  Windows held a fresh connection's first statement past the same timeout. Found by the OME run state-machine test, which failed on Windows CI.
+- **A message the model can never segment no longer blocks its session.**
+  Boundary detection retries an unusable reply three times per call; a
+  message that always produced one stayed in the session's buffer, every
+  later `/add` or `/flush` merged it back in and failed the same way, and the
+  session was stuck until someone cleared the buffer by hand (the async queue
+  marked that session's batches `failed` one after another). The third
+  consecutive call that ends this way now moves the session's buffer and the
+  call's own messages to the `quarantine` track of `unprocessed_buffer`,
+  answers `422 INVALID_INPUT` naming the session and the count, and the next
+  call starts from an empty buffer. Infrastructure failures (no quota,
+  network) are not counted and still propagate as `EXTERNAL_SERVICE_UNAVAILABLE`,
+  so a buffer waits out an outage.
+- **A session-lock timeout could cancel extraction after the memcell was
+  written.** `memorize()` wrapped the whole call in
+  `session_lock_timeout_seconds`; a timeout that landed after the boundary
+  had written the memcell row and consumed the buffer cancelled the
+  extraction pipelines, and nothing retried them: the cell stayed without an
+  episode for good. The timeout now bounds the two places a call can hang
+  while another waits on the lock, the lock wait and the boundary LLM call,
+  both of which run before any write; once a cell is committed its
+  extraction runs to completion, after the lock is released and shielded
+  from a cancelled request. Found by a property test that lands random
+  concurrent calls under random timeouts.
+- **A replayed clustering run inflated the cluster's count.** OME delivers a
+  strategy run at least once; when `trigger_profile_clustering` or
+  `trigger_skill_clustering` ran again for an episode or case it had already
+  folded in (a crash after the upsert, a retry after the emit failed), it
+  folded it in a second time: the member row was deduplicated but `count`
+  rose and the centroid was re-weighted, and `extract_user_profile` gates on
+  that count. An entry already among the owner's members is now left where it
+  is; the downstream event is still emitted.
+- **OME `inspect` ignored the Counter gate's cooldown.** The dry run compared
+  the bucket's counter with the threshold only, so during a cooldown window
+  it reported `will_run: true` for an event `dispatch` would hold back. The
+  store now answers the dry run with the same rule `dispatch` applies
+  (threshold and cooldown, one clock).
+- **Knowledge: a failed `PUT /knowledge/{doc_id}` could leave two
+  directories for one document, or bury the old one inside the new.** The
+  replace path backs the document's directory up, writes the new one and
+  restores the backup on failure; when the failure came *after* the writer
+  had created the new directory (the original-file step, for one), the
+  restore moved the backup inside it if the name was unchanged, or left it
+  next to the restored one if the title or category had changed. The
+  half-written directory is now removed before the backup comes back.
+- **A hand-edited `entry_count` could make a daily-log writer reuse an entry
+  id.** The episode, atomic-fact, foresight and agent-case writers allocated
+  the next id from the frontmatter's `entry_count` alone, so lowering it by
+  hand made the next append produce an id the file already held (the index
+  keeps one of the two), and a non-numeric value raised a `TypeError`. The
+  next id is now allocated from the higher of `entry_count` and the highest
+  sequence number already in the file, and a frontmatter that disagrees is
+  logged.
+- **OME `wait_for_event` returned while a retry was still pending.** The
+  runner records a failed attempt as `FAILED` before its backoff sleep and
+  gives the retry a fresh run id, so during the backoff the event's only row
+  is `FAILED`; `wait_for_event` counted that as terminal and returned.
+  Reflection waits on it before deprecating what the extraction replaced, so
+  it could act on an outcome that was not final. `FAILED` now means "retry
+  pending"; a failure with no retry left is `DEAD_LETTER`, as before.
+- **`to_timestamp_ms` is now the exact inverse of `from_timestamp_ms`.** It
+  computed `int(timestamp() * 1000)`, and the float product sat just below
+  the integer for about 0.6 % of instants (1095954883735 came back as
+  1095954883734); integer arithmetic on the timedelta since the epoch
+  replaces it.
+- **The watcher classified md files the scanner never visits.** Its kind
+  matcher was anchored on the right only, so a path with extra leading
+  components (`x/app/project/users/u/episodes/episode-2026-01-01.md`) was
+  accepted and queued while the root-anchored scanner glob ignored it; the
+  match now requires the same number of path components.
+- **`default_app` / `default_project` are rejected as ids.** They are the
+  on-disk directory names of the default scope, so an app with that literal
+  id shared the default app's directory and its index rows were attributed
+  to `default`. The API now answers `422` for them.
+- **Search: a duplicate id inside the dense pool kept its last score, not
+  its highest**, and the multi-round decider's JSON parser gave up on a reply
+  with a stray `{` in the prose before the object (its docstring promised
+  otherwise); it now also decodes from every brace.
+- **Cascade worker: a bounded wait between optimize and rebuild cancelled the
+  task it waited on.** The optimize runner waits up to 180 s for an in-flight
+  index rebuild of the same kind, and the rebuild loop waits for an in-flight
+  optimize, so the two never commit on one LanceDB manifest at once. Both
+  waits used `asyncio.timeout` around `await task`, which cancels the awaited
+  task when the deadline fires: a rebuild longer than the wait, with a write
+  landing on that table meanwhile, was killed mid-flight, and the rebuild loop
+  ended with it, silently, so no periodic rebuild ran again until restart and
+  that table's index UUID / FTS segment count grew unbounded. The mirror wait
+  cancelled the optimize beat it was meant to stay clear of. Both waits now
+  only stop waiting. Present since 1.2.2.
+- **Cascade: the handler limit held per drain pass, not per worker.** A worker
+  runs at most four handlers of a batch at once, but the limit was created
+  inside each drain pass, so two passes running together each got their own:
+  `POST /cascade/quiesce` drains while the background loop is still draining,
+  and that overlap peaked at eight concurrent handlers. The limit is now
+  shared by the worker. (#492)
+- **Resolving a cluster's members read each member's full row, vectors
+  included.** The profile path maps a fresh cluster's episodes back to their
+  parents and needed two fields per member, yet fetched every member's whole
+  episode row with both embedding vectors; a cluster can hold thousands of
+  members, so that read dominated the path's memory. LanceDB now reads only
+  `parent_type` and `parent_id` (Milvus still loads full rows), and the
+  reflection path's bulk read skips the vector columns. (#490)
+- **`method="vector"` finds episodes when no atomic fact is in scope.**
+  Vector search over episodes recalls through atomic facts, and it returned
+  an empty list (HTTP 200, no log line) whenever none were in scope — fact
+  extraction disabled, not caught up yet, or failing — while keyword search
+  kept answering. It now falls back to each episode's own vector, with
+  `radius` applied, and logs `vector_recall_fact_pool_empty` at info.
+  (#502, #509)
+
+### Upgrade
+
+`pip install --upgrade everos` is enough for most roots, and nothing in this
+release rewrites or re-embeds anything on its own. The first start records
+which model built the index and logs one line saying so.
+
+The first start also creates the `memorize_inbox` table in `system.db` for the
+async queue. `async_mode` is opt-in: clients that never send it get the same
+synchronous responses as before.
+
+Two deployments need attention:
+
+- **A model narrower than `dim`** — the server now refuses to start instead of
+  accepting writes that could never be stored (this is #434). The error names
+  both numbers and the two steps: set `[embedding] dim` (or
+  `EVEROS_EMBEDDING__DIM`) to what the model returns, **then** run `everos
+  cascade rebuild` — the tables were already created at the old width, so
+  fixing the configuration alone is not enough. Your markdown is untouched
+  throughout.
+- **A model wider than `dim`** — unchanged behaviour, but the start now warns
+  that the extra dimensions are truncated. The shipped default is this case
+  (`Qwen/Qwen3-Embedding-4B` returns 2560, `dim` is 1024) and nothing is
+  wrong: that model is Matryoshka-trained, 1024 is one of its published
+  truncation points, and the index compares with cosine distance. Set
+  `dimensions = 1024` to silence it, if your endpoint accepts that parameter.
+
+**Changing `dim` or `model` later** stops the next start and requires `everos
+cascade rebuild`, which re-embeds every entry from markdown — budget for it.
+
+**Downgrading** to an earlier EverOS is safe as long as `dim` is still 1024:
+the older schema check compares column types only and ignores the new record.
+If you changed `dim`, set it back and rebuild before downgrading.
+
+## [1.4.2] - 2026-10-14
+
+**A server that stays healthy for days, not hours.** Three faults in this
+release compounded on exactly the deployments that ran longest: a long-lived
+index leaked file descriptors until searches took seconds, interactive searches
+queued behind the cascade's background embedding, and a memory root holding more
+than one project had each project's index rows overwrite the other's. All three
+are fixed, and a LanceDB root that the last fault already damaged repairs itself
+on the first start after upgrading.
+
+### Changed
+
+- **`[embedding].max_concurrent` defaults to 10 instead of 5.** The
+  `EmbeddingSettings` class default (50) is aligned to the same value; the
+  shipped `default.toml` always overrode it, so the effective default moves
+  from 5 to 10. (#486)
+
+- **Milvus collections must be rebuilt once after upgrading.** They gain the
+  `__pk` primary-key column; the server refuses to start on an old
+  collection and names `everos cascade rebuild`, which recreates them from
+  markdown.
+
+- Response `id`s are unique within `(app_id, project_id)`, not globally; the
+  shape of `id` is unchanged.
+
+- **The cascade optimizes a LanceDB table at most once a minute, not once
+  every ten seconds.** Each optimize pass leaves an `_indices/<uuid>/`
+  directory behind until cleanup reclaims it, so the old 10 s floor set the
+  ceiling on how many could pile up: about 126k directories a day and ~1.8M
+  at the retention horizon. The 60 s default costs a sixth of that (~21k a
+  day, ~300k at the horizon, roughly 1.2 GB) and keeps a full index sweep
+  inside its 60 s deadline. The interval is a built-in floor on how often a
+  table may be optimized, not a setting; a write-heavy deployment sees an
+  index that trails its markdown by up to a minute longer than before.
+
+### Fixed
+
+- **A long-running server no longer leaks file descriptors on LanceDB index
+  readers.** Every `optimize()` mints a new index version whose reader is
+  kept in a session cache, and that reader holds the descriptors of its
+  `_indices/<uuid>/` files. Lance keys those cache entries by dataset
+  version and never evicts them when cleanup deletes the files underneath
+  (`lance-format/lance#7718`), so the count grew for the life of the
+  process: a 65-minute soak went from 74 to 558 index descriptors with no
+  plateau, and a deployment on a 1024-descriptor limit exhausts it in
+  hours. EverOS capped only one of the session's two caches and left the
+  metadata cache unbounded, which is the one that decides whether the count
+  converges. Both are now capped (`[lancedb].metadata_cache_size_bytes`,
+  default 1 MB): the same soak holds between 6 and 82 descriptors, falling
+  as often as it rises. Reported upstream as `lance-format/lance#9934`.
+
+- **An interactive search no longer queues behind the cascade's embedding
+  work.** Query embeddings and background write embeddings shared one
+  process-wide semaphore, so a burst of writes put the query a user was
+  waiting on at the back of the queue. Under three concurrent writers,
+  vector search p50 measured 46 s and p95 112 s, while the keyword leg —
+  which needs no embedding — answered in 0.35 s. Queries now draw on their
+  own budget (`[embedding].query_max_concurrent`, default 4): vector p50
+  drops to 0.60 s and p95 to 3.70 s under the identical load. Total
+  in-flight requests to the endpoint become `max_concurrent +
+  query_max_concurrent` rather than a silently shared bound. (#473)
+
+- **The same owner's memories in two projects no longer overwrite each other
+  in the derived index.** Index rows were merged on `id` alone, and `id` is
+  unique only within one `(app_id, project_id)`: a user's episodes, atomic
+  facts, agent cases, foresights, skills and profile written under a second
+  project replaced the first project's rows (markdown was never affected).
+  Every table now declares `PRIMARY_KEY = ("app_id", "project_id", "id")`;
+  LanceDB merges on it and Milvus keys its collections on the composed
+  `__pk` column. Profile search and get, the handlers' change detection and
+  the vector backfill address rows by the full key; the backfill also keeps
+  each row's own vector within a batch, and reflection deprecates atomic
+  facts only inside the project it merged.
+
+- **A multi-project LanceDB root indexed before this release gets its
+  overwritten rows back by itself.** The first full pass over the root
+  after upgrading (server start, or `everos cascade sync`) re-reconciles
+  every indexed markdown file against the index once and records that in
+  `.index/.index_reconcile_version`. Entries whose rows are present and
+  unchanged are skipped by digest, so a healthy root pays one read pass
+  and no embedding; only the rows that were lost are re-embedded.
+  `everos cascade sync --force-all` runs the same pass on demand. Two
+  roots need that command instead: a server started with
+  `EVEROS_DISABLE_CASCADE=1` never runs the pass (stop it and run
+  `everos cascade sync --force-all` once), and a multi-project root where
+  reflection ran before this release needs `everos cascade rebuild` once,
+  because the pass does not clear the `deprecated_by` stamps one project's
+  reflection left on another project's rows.
+
+- **`POST /cascade/quiesce` freezes a complete index.** Its drain stopped
+  at the worker's per-drain bound, and inside a server it could also stop
+  while the background worker still held the last batch, which the stop
+  that follows then orphaned in `processing`; the ledger an upgrade
+  re-queues made both routine. The drain now runs until the ledger holds
+  nothing pending, waiting for the worker's in-flight batch, and
+  `everos cascade sync` / `rebuild` use the same loop.
+
+- **A cascade pass embeds a file's changed entries in one batched request,
+  not one request per entry.** The four daily-log handlers (episode, atomic
+  fact, foresight, agent case) each called the embedding endpoint once per
+  entry, so a turn that wrote ~20 atomic facts queued ~20 single-input
+  requests on the process-wide embedding semaphore, and the next search's
+  query embedding waited behind all of them: about five times the
+  endpoint's latency at the previous default `max_concurrent = 5`. The
+  handlers now
+  send every text of a file through `embed_batch`, which
+  `[embedding].batch_size` splits into requests (23 entries become 3
+  requests at the default 10), so after a single turn's writes the query
+  embedding waits for one request; a large backlog still queues ahead of
+  it (#473). (#486)
+
+- **Changing a knowledge document's category keeps it inside `knowledge/`.**
+  `PATCH /knowledge/documents/{doc_id}` with `category_id` set to `..` moved
+  the document's directory up into the project directory, where the markdown
+  scan no longer finds it. The category now goes through the same rule as
+  document creation, so `.` and `..` fall back to `Others`, and the move is
+  refused if its target would leave `knowledge/`. A document an earlier move
+  left outside is moved back on its next category change. Reported by
+  White0xdi3.
+
+### Upgrade
+
+`pip install --upgrade everos` is enough for most roots: the first full pass
+after the upgrade (server start, or `everos cascade sync`) re-reconciles every
+indexed markdown file against the index once, re-embeds only the rows that were
+lost, and records that it ran in `.index/.index_reconcile_version`. A healthy
+root pays one read pass and no embedding.
+
+Three roots need a command instead:
+
+- **A root where reflection already ran across projects** — `everos cascade
+  rebuild` once. The automatic pass does not clear the `deprecated_by` stamps
+  one project's reflection left on another project's rows.
+- **A server started with `EVEROS_DISABLE_CASCADE=1`** — it never runs the
+  pass. Stop it and run `everos cascade sync --force-all` once.
+- **A Milvus derived index** — `everos cascade rebuild` once. Collections gain
+  the `__pk` primary-key column and the server refuses to start on an old
+  collection.
+## [1.4.1] - 2026-09-24
+
+**A fresh install works again.** The `openai` SDK released its 3.x line on
+2026-09-24; an unconstrained install picked it up together with an httpx
+pre-release, and every LLM and embedding call failed before reaching the
+network. This release pins the SDK to the 2.x line the project is tested
+against. Nothing else changed since 1.4.0.
+
+### Fixed
+
+- **`openai` is pinned below 3.** Fresh installs from PyPI resolved
+  `openai 3.19.2`, whose client raises `AttributeError: module 'httpx' has no
+  attribute 'Timeout'` on every request, so memorize and hybrid / vector
+  search returned 500. Existing environments built from `uv.lock` were never
+  affected.
+
+### Upgrade
+
+- `pip install --upgrade everos` brings `openai` back to 2.x. If a fresh
+  install of 1.4.0 (or any earlier version) today shows the `httpx` error
+  above, upgrade to 1.4.1 or run `pip install "openai<3"`.
+
+## [1.4.0] - 2026-09-24
+
+**EverOS runs natively on Windows, and dense search stops scanning the whole
+table.** `pip install everos` on a stock Windows 11 machine now works with no
+manual steps beyond an LLM key; the unit suite runs on Windows in CI. Every
+vector column gets an IVF_FLAT index once it holds enough rows, built and
+maintained by the cascade worker, so hybrid search no longer reads the entire
+column per query. A ten-hour Windows soak drove the rest of this release: a
+second process can no longer write the index behind a running server, watcher
+events for one file commit in the order they arrived, and a transient Lance
+spill failure is retried instead of filing the markdown file as unrecoverable.
+
+### Added
+
+- **Native Windows support.** The package ships the MSVC runtime
+  (`msvc-runtime`, Windows only) and registers its directory before any
+  native extension loads, so a clean machine needs no Visual C++
+  Redistributable. Text fixtures are read as UTF-8 regardless of the system
+  locale, and a `unit tests (Windows)` CI job covers the platform.
+  [docs/windows.md](docs/windows.md) leads with the native install and keeps
+  the WSL2 walkthrough.
+- **Vector (ANN) indexes.** Once a vector column holds
+  `[lancedb] vector_index_min_rows` (default 2000) non-null vectors, the
+  cascade worker builds an IVF_FLAT cosine index on it — on its first rebuild
+  sweep after server start and on the heavy maintenance beat — and retrains it
+  once light-beat delta indices pile past 16. Partition size (4096 rows) and
+  `nprobes` (32) are pinned together, so the search is exact up to ~130k rows.
+  Measured on 27k rows of 1024-dim vectors: 245 ms → 84 ms per query with
+  recall@10 of 0.98. The CLI never builds indexes; only the server's worker
+  does.
+- **`[cascade] scan_interval_seconds`** is a setting (default 30 s) instead of
+  a constant.
+
+### Changed
+
+- **`everos cascade sync`, `cascade fix --apply` and `cascade rebuild` refuse
+  to run next to a running server** (exit code 3) and hold the root's lock for
+  their whole run. Two processes writing the same index inserted every row
+  twice; a running server projects markdown changes on its own.
+- **pyarrow floor raised to 25.0.1.** Materialising timestamp columns no
+  longer imports `pytz` per value on the query hot path (a 312 ms → 13 ms
+  difference per query on Windows).
+- **Watcher paths are relativised without a `resolve()` per event**, which was
+  ~40 % of the worker threads' CPU under write load on Windows.
+- **A late `modified` event for a path that is already gone is recorded as a
+  deletion**, so a create-then-unlink inside the event latency window cannot
+  resurrect a file.
+- **`POST /memory/add` rejects a `role = "tool"` message without
+  `tool_call_id` with 422** instead of failing with 500 inside extraction.
+- **OME strategies only receive event classes they declared.** A bare manual
+  tick no longer reaches business-event strategies (which crashed on it), and a
+  manual trigger reaches a Cron strategy again.
+- **API docs** describe the response envelope's exceptions and the OME latency
+  after a flush.
+- **Milvus CI** pulls MinIO from quay.io (the Docker Hub image was withdrawn).
+
+### Fixed
+
+- **Watcher upserts for one file commit in delivery order.** Each event used to
+  schedule its own upsert and the last committer won; Windows synthesises a
+  `created` per freshly created parent directory, so a stale duplicate could
+  put the first write's mtime back on the row after an atomic save. Sequence
+  numbers are now unique as well.
+- **Transient Lance spill failures are retried.** `LanceError(IO): Execution
+  error: Spill has sent an error` (DataFusion spilling to the temp dir under
+  heavy concurrent writes) surfaced as a bare `RuntimeError` on `merge_insert`
+  and marked the markdown file permanently failed; it is now a retryable error
+  and the same row projects on the next attempt.
+- **Markdown staging swap survives a Windows sharing violation.** `os.replace`
+  over a file another process has open (the worker, an antivirus scan) is
+  retried with backoff instead of failing the write.
+- **Deleting a knowledge document before it was indexed removes its directory**
+  and reports the real topic count instead of leaving the files to be re-indexed.
+
+### Upgrade
+
+- **First server start builds the vector indexes** on every table past the row
+  threshold: seconds per 10k rows of 1024-dim vectors (0.5 s at 27k, ~1.4 s at
+  100k per column), during which searches keep working with a flat scan. Set
+  `[lancedb] vector_index_min_rows` higher to defer it.
+- **Stores created before the `subject_vector` column existed** fail the
+  startup schema check with `LanceDBSchemaMismatchError`. Stop the server and
+  run `EVEROS_ROOT=<memory root> everos cascade rebuild` — it re-indexes from
+  markdown, which stays the source of truth. Note that `cascade rebuild` reads
+  the root from `EVEROS_ROOT`, not from `--root`.
+- **Scripts that ran `everos cascade sync` next to a running server** now get
+  exit code 3. Drop the call (the server projects changes itself) or stop the
+  server first.
+- **pyarrow ≥ 25.0.1** is required; `pip install --upgrade everos` resolves it.
+
+## [1.3.1] - 2026-09-08
+
+**One reproducible runner for four long-term-memory benchmarks, plus an
+LLM-guided multi-round retrieval method.** LoCoMo, LongMemEval, EverMemBench,
+and SubtleMemory now share the same staged ADD → SEARCH → ANSWER → JUDGE
+workflow, resume model, metrics, and run manifest. The new
+`llm_multiround` search method iteratively recalls episode blocks, asks a
+separately configurable decider to retain core evidence and issue follow-up
+queries, and returns a bounded final context without a cross-encoder.
+
+### Added
+
+- **LLM-guided multi-round episode retrieval.**
+  `POST /api/v2/memory/search` accepts `method = "llm_multiround"` for user
+  memory. Each round independently fuses BM25 and vector candidates for the
+  current sub-queries with RRF, then uses the decider to select core evidence
+  and identify remaining gaps. Existing search response fields are unchanged;
+  decider failures are recorded in structured logs and optional trace dumps.
+- **Independent decider configuration.** The new `[decider]` section selects
+  the model, endpoint, timeout, request extras, retry policy, and loop tuning.
+  Empty connection fields inherit `[llm]`, preserving single-model setups.
+- **Unified benchmark harness.** One runner and four adapters cover LoCoMo,
+  LongMemEval, EverMemBench, and SubtleMemory with explicit dataset configs,
+  resumable stage artifacts, deterministic run identities, shared IR metrics,
+  decider preflight checks, and trace validation that rejects degraded
+  multi-round runs before reporting scores.
+- **Cascade snapshot control.** `POST /api/v1/cascade/quiesce` and
+  `POST /api/v2/cascade/quiesce` drain the Markdown-to-index queue and stop the
+  cascade subsystem until restart. Startup switches can disable all cascade
+  work or only the filesystem watcher for managed read-only workloads.
+
+### Changed
+
+- **OME attempts are bounded.** One strategy attempt now has a 1,800-second
+  default wall-clock timeout and follows the existing retry/dead-letter path on
+  timeout. Environment settings can tune concurrency or disable the timeout.
+- **SQLite pool saturation fails visibly.** Pool size, overflow, checkout
+  timeout, recycle, and pre-ping are explicit settings; exhausted pools now
+  raise after a bounded wait and emit saturation diagnostics instead of waiting
+  indefinitely.
+- **Extraction LLM transport is configurable.** `[llm]` now exposes request
+  timeout and provider-specific SDK arguments while retaining the previous
+  60-second default.
+
+### Fixed
+
+- **Permanent embedding request errors no longer retry.** HTTP 400, 401, 403,
+  404, 413, 414, and 422 responses are classified as rejected input or
+  configuration and leave the retry loop; timeouts, 429 responses, and server
+  errors remain retryable.
+- **EverMemBench owner mapping no longer changes profile extraction.** The
+  adapter uses one stable synthetic owner per topic for both ingestion and
+  search while preserving each real participant's name in message metadata.
+  The production Profile cluster/direct extraction paths are unchanged.
+
+### Upgrade
+
+- No storage migration or index rebuild is required. Existing search methods
+  keep their prior behavior unless callers explicitly select
+  `llm_multiround`.
+- Deployments with a healthy OME strategy that legitimately runs for more than
+  1,800 seconds must raise `EVEROS_OME_RUN_TIMEOUT_SECONDS` or set it to `0` /
+  `off` before upgrading.
+
+## [1.3.0] - 2026-09-07
+
+**Milvus as an optional index backend, behind a port that hides which one you
+run.** The rebuildable BM25/vector index can now live in a remote Milvus Server
+or Zilliz Cloud instead of the embedded LanceDB, selected by one setting and
+verified at startup. Nothing about the default installation changes: LanceDB
+stays the backend, `pymilvus` stays an optional extra, and markdown stays the
+source of truth — the index is derived either way, so switching backends is a
+rebuild, not a migration. Both backends implement the same typed ports, so
+cascade, search and `/get` never branch on physical storage; a filter is a
+backend-neutral predicate tree rather than a rendered SQL string, which is what
+lets one set of contract tests hold both adapters to the same behaviour. The
+vector metric is now cosine everywhere, which corrects an inconsistency
+described under Changed.
+
+### Added
+
+- **Optional Milvus derived-index backend.** Install with
+  `pip install everos[milvus]` and select it with:
+
+  ```toml
+  [index]
+  backend = "milvus"
+
+  [milvus]
+  uri = "http://127.0.0.1:19530"   # or a Zilliz Cloud endpoint
+  token = ""                        # Zilliz Cloud API key
+  db_name = ""
+  consistency_level = "Session"     # Strong | Bounded | Session | Eventually
+  collection_prefix = "everos"
+  ```
+
+  Every field binds to an environment variable
+  (`EVEROS_INDEX__BACKEND`, `EVEROS_MILVUS__URI`, ...). The seven business
+  tables are created as `<collection_prefix>_<kind>`.
+
+  **Remote Milvus Server or Zilliz Cloud only.** A local database path is
+  rejected at startup rather than silently accepted: embedded Milvus Lite is
+  not supported, because its pure-Python rewrite degrades a single query to a
+  full scan and drops search-time parameters.
+
+  Startup verifies the physical collection field by field — datatype, primary
+  key, nullability, vector dimension, and the index metric (dense `COSINE`,
+  BM25 output fields) — so a collection that disagrees with the declared schema
+  fails immediately instead of at the first write or search.
+
+### Changed
+
+- **Vector search now uses cosine distance on LanceDB too.** The generic
+  vector path called `nearest_to()` without a distance type, so it ran on
+  LanceDB's L2 default while `agent_skill` recall and every Milvus query
+  already used cosine. All of them are cosine now. **Ranking can shift for
+  existing deployments** — the same vectors are scored by a different metric.
+  No action is required and no rebuild is involved; the index is unchanged.
+- **everalgo's transitive layer is pinned.** `everalgo-boundary`,
+  `everalgo-core` and `everalgo-clustering` are now direct `==` dependencies
+  matching the versions the test suite resolves. The consumer packages declare
+  them as `>=0.2.0,<2.0.0`, which treats a 0.x line as if only a major bump
+  could break compatibility, so a fresh resolution could pick releases the
+  suite had never run against. Raise them deliberately, together with a smoke
+  run against a PyPI-resolved install — `make package` installs the built
+  wheel with `--no-deps`, so it cannot catch a resolution break on its own.
+
+### Fixed
+
+- **`POST /api/v1/memory/add` no longer fails on a freshly resolved install.**
+  `everalgo-boundary` 0.3.0 added a third required field to the public
+  `DetectionResult` NamedTuple while `everalgo-agent-memory` 0.4.0 still built
+  it with two, so a default (`memorize.mode = "agent"`) install answered
+  `500 TypeError: DetectionResult.__new__() missing 1 required positional
+  argument: 'should_wait'`. Chat mode was unaffected. The pin above resolves
+  the compatible pair.
+- **Milvus datetime round-trips are exact below the millisecond threshold.**
+  Timestamps were written in milliseconds but read back through a
+  seconds-or-milliseconds heuristic, so any instant before 2001-09-09 either
+  landed in the year 30000 or raised `ValueError`. Physical column reads now
+  use an exact inverse.
+- **Concurrent `update()` on the Milvus backend no longer loses writes.** The
+  read half of the read-modify-write cycle sat outside the write lock, so a
+  backfill writing `vector` and a reflection writing `deprecated_by` could
+  overwrite each other on the same row. Both halves share one lock, and the
+  silent 10,000-row truncation on that path is gone.
+- **Milvus queries stay inside the engine's result window.** Row scans and
+  search `topK` are bounded by the 16,384-row ceiling instead of requesting
+  more and failing.
+
+## [1.2.3] - 2026-08-07
+
+**Background maintenance that fails loudly instead of quietly.** A soak run on
+1.2.2 found a table that had stopped reclaiming disk for 100 minutes while
+`/health` stayed green — nothing had *failed*, a call had simply never returned,
+and every signal was built from failure counters. Auditing for that shape turned
+up six more places it could happen: reads with no deadline (which stop the whole
+md to LanceDB projection, not just one table), background loops that die
+permanently on one exception with no log at all, an alert counter reset by the
+remediation it triggers. All of them are now bounded, and a stall that does
+happen names the table it happened to. Alongside that, agent-skill extraction is
+rescued from a retry-then-dead-letter loop, keyword search no longer returns 500
+during an index rebuild, and the maintenance cadences moved into settings.
+
+### Fixed
+
+- **Agent skill extraction is no longer stuck in a retry-then-dead-letter
+  loop.** Target case data now travels on `SkillClusterUpdated` and existing
+  skills for the cluster are read from markdown (strong-consistency), so the
+  strategy never races cascade indexing. Prior to this fix, running a fresh
+  agent trajectory produced zero `SKILL.md` files — `.skills/` did not exist.
+  **The related stale-index clobber is fully closed only for clusters at or
+  below `MAX_SKILLS_IN_PROMPT` (10).** Above it, markdown still supplies the
+  candidate set but LanceDB orders it, and the skill a lagging index omits is
+  by definition the one written most recently — the one most likely to need
+  `update` — so it can be ranked out of the prompt and re-added instead. The
+  window is narrow (it needs a cluster over 10 skills *and* an index that has
+  not caught up) and the consequence is the pre-existing full-replace, not a
+  new failure mode.
+- **`POST /api/v2/ome/trigger` no longer masks strategy state.** The `status`
+  field now distinguishes `not_dispatched` (all dispatch gates rejected the
+  strategy — usually a missing `"force": true`) from `ok` (dispatched and
+  settled). The new `runs` field surfaces dead-lettered strategy runs that
+  were previously invisible to the caller. **If your client matches
+  `status` exhaustively (Python `Literal`, TypeScript union), add a
+  `not_dispatched` branch.**
+- **Agentic search on agent memory now uses the skill-shaped rerank
+  passage.** The cross-encoder previously saw only the raw `description`
+  field instead of the `name + description + skill instruction` triple that
+  the HYBRID lane uses. A skill with empty `description` (a legal everalgo
+  output — see `everalgo/agent_memory/skill_ops.py:294`) no longer causes
+  HTTP 500 during the LLM sufficiency check.
+- **OME strategy retries now back off between attempts.** A retry-class error
+  (e.g. waiting on eventually-consistent state) previously exhausted its
+  `max_retries` budget in milliseconds; the loop now sleeps
+  `min(base * 2**(attempt-1), cap)` plus up to `jitter` seconds
+  (defaults: `1s` base / `10s` cap / `0.5s` jitter — code-only defaults,
+  not currently exposed via `everos.toml` or `ome.toml`). **`engine_sem` is
+  now held per attempt rather than across the whole retry chain**, so the
+  backoff sleep does not occupy a concurrency slot. The cap bounds
+  concurrent strategy *work* — LLM calls, embeddings, storage IO — and a
+  coroutine waiting to retry consumes none of it; holding the slot would
+  have turned a partial outage into a total stall, since enough
+  simultaneously-failing runs park every one of the
+  `max_concurrent_runs` slots in `asyncio.sleep` and starve strategies that
+  would have succeeded. Backpressure on failing work is intended;
+  backpressure on everything else is not.
+- **Path-traversal hardening for LLM-generated agent-skill names (CWE-22).**
+  `AgentSkillFrontmatter.name` comes straight from LLM output
+  (`extract_agent_skill`) and was concatenated unsanitized into the
+  `skills/skill_<name>/` directory segment on both the write and read
+  paths; given a sufficiently long `../` prefix, the write target could
+  escape the memory root. This is the same class of defect previously
+  fixed for knowledge-upload titles/categories (see `knowledge_writer.py`
+  in an earlier 1.2.x). The sanitizer is now a single shared helper
+  (`everos.core.persistence.markdown.sanitize_dirname`) used by both
+  `KnowledgeWriter` and the new `SkillPathMixin.skill_dir_name()` /
+  `sanitize_skill_name()`, instead of two independently maintained copies.
+  `extract_agent_skill` now sanitizes the LLM-emitted name *before*
+  constructing `AgentSkillFrontmatter`, so **`AgentSkillFrontmatter.name`
+  and the LanceDB `agent_skill` primary key now hold the sanitized name**
+  (spaces become `_`, characters outside `[\w\-.]` are dropped, capped at
+  50 chars), not the raw LLM output — a user-visible change for anything
+  that reads a skill's `name` field expecting the verbatim LLM string.
+  `AgentSkillFrontmatter.name` also gained a validator rejecting a name
+  containing a path separator, or being exactly `..`, so a hand-edited
+  `SKILL.md` that bypasses the writer's sanitization is caught on read
+  rather than silently relocated (the substring form, e.g. a name that
+  merely *contains* `..`, is deliberately allowed — sanitized output can
+  legitimately contain runs of literal dots). `sanitize_dirname` itself
+  falls back (not just on an empty result, but also on `.` or `..`) so a
+  short input that is itself a sanitizer fixpoint — e.g. `"../"` sanitizes
+  to `".."` verbatim without this fallback — cannot resolve to the same
+  directory or its parent; this closes both the agent-skill case and an
+  equivalent one-level escape on the knowledge-upload path, which has no
+  `skill_`-style prefix protecting its sanitized segment. **No data
+  migration is needed for agent skills**: extraction has never
+  successfully produced a `SKILL.md` before this release (see the
+  cascade-lag fix above), so there is no legacy skill corpus whose
+  directory names would change. **Knowledge documents do have a
+  pre-existing corpus**, and two inputs resolve to a different directory
+  than before: a decomposed (NFD) topic or category now keeps its
+  combining marks (`"Résumé"` no longer degrades to `"Resume"`) because
+  the shared helper NFC-normalizes first, and a topic or category of
+  exactly `.` or `..` now falls back instead of resolving onto the
+  parent directory. Precomposed input — including CJK — is unaffected;
+  the character class is unchanged from the previous private copy.
+  Sanitizing is lossy: skills whose raw names
+  differ only in characters the sanitizer drops or replaces (e.g.
+  `"fix django"` vs. `"fix_django"`) now share one `SKILL.md`, and so do
+  names differing only in a combining mark regardless of script (e.g.
+  Devanagari `"किताब"` vs. `"कताब"` — a combining mark alone is not `\w`
+  and is stripped either way; same for Thai tone marks, Hebrew niqqud,
+  Arabic harakat). The later write wins — the earlier skill's
+  `source_case_ids`, `maturity_score`, and body are silently lost, not
+  merged. Case is *not* folded, so `"Fix Django"` and `"fix django"` stay
+  two distinct sanitized names — two LanceDB rows, but one directory on a
+  case-insensitive filesystem (macOS APFS and Windows NTFS defaults),
+  where the index then advertises a name whose content was overwritten.
+  This is accepted for now rather than mitigated: detecting a collision
+  and raising would reintroduce the dead-letter DoS the sanitizer was
+  built to avoid, and a disambiguating suffix — the workable option —
+  needs a collision probe plus a case-folding rule, so it is deferred to
+  a deliberate pass rather than added here.
+- **A renamed skill no longer leaves an orphan directory that pollutes the
+  next extraction.** everalgo treats a name change as a first-class update
+  (`skill_ops._apply_update` preserves `prior.id` while swapping the name),
+  so the emitted skill was written to a new `skill_<new_name>/` while the
+  old directory survived carrying the same `cluster_id`. Because existing
+  skills are now read from markdown rather than LanceDB, that orphan did
+  not merely sit on disk — it came back in the next run's
+  `existing_relevant_skills` as a duplicate of a skill the LLM had already
+  renamed, feeding exactly the `add`-instead-of-`update` full-replace
+  clobber this release set out to close, once more per rename. The old
+  directory is now reaped after the new one is written, keyed on the
+  skill's `id` (the only thing that survives a rename; a fresh `add` mints
+  a uuid and can never match). A prior name that another skill in the same
+  batch just claimed is never deleted.
+- **`extract_agent_skill` retire ops are documented as unimplemented rather
+  than silently mispersisted.** `AgentSkillExtractor.aextract` returns a
+  flat list with no op discriminator, so a retirement arrives as an
+  ordinary skill with `confidence < retire_confidence` and was written back
+  like any other — staying in markdown, in the next prompt, and in search.
+  The behaviour is unchanged; the module docstring no longer claims retire
+  is handled. Honouring it is a design decision (delete the directory, or
+  add a `retired` flag that the enumeration, cascade, and search all
+  filter on) deferred to its own change.
+- **`reference_name` and `script_filename` are sanitized.** Both are
+  appended *after* the `skill_<name>` segment, so `skill_dir_name` never
+  covered them; they now go through the same `sanitize_dirname` primitive
+  on both the reader and the writer. No caller in `src/` reaches them
+  today, so nothing was exploitable — this closes the gap before
+  progressive disclosure wires them up.
+- **A single unparseable `SKILL.md` no longer disables skill extraction
+  for its whole cluster.** `AgentSkillReader.list_by_cluster` propagated
+  any frontmatter `ValidationError`, which aborted the enumeration that
+  feeds `extract_agent_skill` its existing skills — so one hand-edited
+  file (or, after a future schema revision adds a required field, every
+  existing file at once) dead-lettered that cluster's extraction on every
+  run. Offending files are now logged and skipped. `read_main` still
+  raises, since a caller naming one specific skill needs to hear about
+  corruption rather than receive the `None` that already means "not
+  created yet".
+  merged. This is accepted, not mitigated, on two grounds: a
+  disambiguating suffix would break the `name` ≡ directory-suffix
+  identity the reader/writer relies on, and detecting a collision and
+  raising would reintroduce the dead-letter DoS the sanitizer was built
+  to avoid.
+  `"fix django"` vs. `"fix_django"`) now share one `SKILL.md`, and the
+  later write wins — the earlier skill's `source_case_ids`,
+  `maturity_score`, and body are silently lost, not merged. This is
+  accepted, not mitigated: the LLM's add/update decision is keyed on the
+  name it sees, so a collision usually reads as an intended update
+  anyway.
+  under the new sanitizer.
+  `KnowledgeWriter` and the new `SkillPathMixin.skill_dir_name()`, instead
+  of two independently maintained copies. `AgentSkillFrontmatter.name`
+  also gained a validator rejecting path separators / `..` so a
+  hand-edited `SKILL.md` is caught on read rather than silently
+  relocated. No data migration: agent-skill extraction has never
+  successfully produced a `SKILL.md` before this release (see the
+  cascade-lag fix above), so there is no legacy skill corpus whose
+  directory names would change under the new sanitizer.
+- **Reads now carry a deadline** (`count` / `get_by_id` / `find_where` /
+  `find_where_paginated` / `search`). The write-side deadline work skipped them
+  on the reasoning that a read takes no lock and so blocks no writer — true, but
+  the cascade drain loop reads on every batch and advances strictly one batch at
+  a time, so a read that never returns stops the **whole md → LanceDB
+  projection**: claimed rows stay `processing` forever, nothing new is indexed,
+  and `/health` still reports healthy because a hang raises nothing. Budget 60s
+  (~1000x the measured 62ms flat scan over 117k rows); expiry raises the
+  retryable `VectorStoreBusyError`.
+- **Background loops are supervised.** The drain / heartbeat / rebuild loops were
+  plain `create_task` coroutines: one uncaught exception ended that loop
+  permanently, and because the worker holds a strong reference to the task the
+  interpreter never printed "Task exception was never retrieved" either — the
+  loop's job simply stopped happening with zero output. Each now runs under a
+  supervisor that logs and restarts with escalating backoff (5s / 15s / 45s),
+  then asks the process to exit via `SIGTERM` so a restarting supervisor
+  (systemd, Docker, k8s) can recover it. The restart budget counts consecutive
+  *quick* crashes, not crashes over the process lifetime — a body that ran 60s+
+  before raising starts a fresh incident, so independent transients days apart
+  cannot pool into a process exit (same windowed counting as systemd's
+  `StartLimitIntervalSec`). A done-callback covers the case the supervisor
+  itself ends unexpectedly.
+- **The optimize-failure alert is reachable again.** The fallback rebuild reset
+  the same counter the health verdict reads, so a table failing 100% of the time
+  cycled `1..5 → 0 → 1..` and the threshold value existed only during the
+  sub-second rebuild — roughly 1% observable against a 30s scrape, so
+  `cascade.healthy` stayed green while the table never reclaimed a version. The
+  rate limiter now lives in its own counter (`failures_since_fallback`); only a
+  successful optimize clears the alert streak. Same shape as the cross-kind
+  `max()` masking bug: a remediation path refreshing the signal meant to report
+  it.
+- **A rebuild no longer leaves the column without an FTS index.** `rebuild_indexes`
+  dropped every index and recreated it, on the assumption that LanceDB falls
+  back to a brute-force scan meanwhile. That holds for vector search and **not**
+  for FTS: with no inverted index a BM25 query raises `Cannot perform full text
+  search unless an INVERTED index has been created`, and since the recall legs
+  are gathered without `return_exceptions`, one failing leg 500s the whole
+  search request. Now uses `create_index(replace=True)`, which swaps atomically
+  — measured 0 failures across 49 queries spanning 3 replaces, versus 55
+  failures for the same test against drop-then-create — and collapses the live
+  index fragment set exactly as before (7 index files back to 4).
+- **The empty-index-dir sweep is bounded by lance's own threshold.** lance's
+  `cleanup.rs` unlinks a superseded index's files but never its directory — it
+  contains no `rmdir` at all, which is structural rather than an oversight: it
+  targets object stores, where paths are flat keys and an empty directory does
+  not exist. Only a local filesystem materialises them, and a soak run reached
+  13061 dirs, 98% empty. everos sweeps them, now with three independent
+  guarantees instead of a self-chosen age: `rmdir` cannot delete a non-empty
+  directory (the kernel refuses it, so no file can be lost and there is no
+  check-then-act window), live index UUIDs are excluded via `list_indices()`,
+  and anything else must outlive `UNVERIFIED_THRESHOLD_DAYS = 7` — lance's own
+  bound for deciding an unreferenced index UUID is dead rather than mid-build.
+  The previous 300s was our invention, which is what made it indefensible.
+  Two consequences worth knowing: the age gate reads the dir's mtime, which
+  POSIX bumps when lance's cleanup empties it, so the effective reclaim horizon
+  is up to ~14 days (file wait + age gate) and the ceiling-load steady state is
+  ~1.8M dirs / ~7GB; and a sweep that blows its 60s deadline is swallowed
+  inside `prune()` — the cleanup commit already succeeded, so escaping would
+  bill a prune "failure" (feeding the fallback-rebuild threshold) and stall the
+  prune-staleness clock for a cleanup stall that did not happen.
+- **The optimize runner's wait on an in-flight rebuild is bounded too.** The two
+  maintenance jobs park on each other — whichever arrives second waits — so an
+  unbounded wait on this side is the same hazard as the one already fixed on
+  the rebuild side, just seen from the other end: the kind's task slot stays
+  occupied, `_schedule_optimize` keeps short-circuiting on it, and that table
+  quietly stops being pruned. It was left open on the argument that
+  `rebuild_indexes` carries its own 300s deadline, which covers its critical
+  section but not the task's dispatch and teardown, so the transitive bound was
+  never real. Now bounded at 180s, logging
+  `cascade_lancedb_optimize_skipped_rebuild_unfinished` and skipping the beat
+  rather than compacting under a live rebuild — the two commit on the same
+  manifest, which is what the wait exists to prevent.
+- **A rebuild that loses a commit race is retried** instead of waiting out the
+  full 12h cadence. Lance labels the conflict `Retryable` and it is: a
+  concurrent writer in another process won the manifest, nothing is wrong with
+  the table. Retries are scheduled on the kind (10min / 30min / 3h) rather than
+  slept through, so the other kinds in the sweep are not parked behind the
+  backoff. A soak run at a 600s cadence hit 3 conflicts in 119 attempts, all
+  while a concurrent CLI storm was running.
+
+- **The index-rebuild sweep can no longer park forever** waiting on the
+  optimize runner. That wait had no deadline, and the runner's loop condition is
+  "keep going while there is unindexed data" — which under sustained writes is
+  never, since the drain loop re-raises the flag every second against a 10s
+  cooldown. Now bounded at 180s, logging
+  `cascade_lancedb_rebuild_skipped_optimize_unfinished` and skipping the sweep
+  rather than dropping indices under a live optimize. **This makes the stall
+  visible, not absent**: under sustained ingest every sweep still times out, so
+  active index-UUID / FTS `part_N` growth stays unbounded there. The functional
+  fix requires the optimize runner to yield when a rebuild is pending, which
+  changes the optimize/rebuild mutual-exclusion contract and needs its own
+  validation — the rebuild cadence is 12h, longer than any soak run so far, so
+  the periodic sweep has never been exercised under load.
+- **The memory-root lock wait is bounded and visible.** Acquisition polls with
+  `LOCK_NB` instead of blocking inside a worker thread: a blocking `flock` could
+  not be bounded or cancelled — cancelling the awaiting coroutine left the
+  thread to acquire the lock later with nobody to release it. The wait itself is
+  by design (the second process is supposed to wait, then find the migration
+  already done), but it now logs `memory_root_lock_waiting` and gives up after
+  `timeout_seconds` (default 30min) instead of leaving a server startup looking
+  like a hang whose last message is `lifespan_provider_startup name=lancedb`.
+  The default sits an order of magnitude above the worst legitimate hold (a
+  large migration is minutes) on purpose: the wait is already visible from the
+  first poll, and against the one case the bound exists for — a holder that is
+  alive but wedged — giving up at 5 minutes buys nothing over 30, while a bound
+  near the legitimate hold turns a slow migration into startup crashes for
+  every waiting process.
+
+### Added
+
+- `OfflineEngine.trigger_manual` now returns
+  `tuple[BaseEvent, list[tuple[StrategyMeta, str]]]` instead of `None`,
+  enabling the `dispatched`/`runs` fields below.
+- `TriggerResponse` gains `dispatched: int` and `runs: list[RunSummary]`.
+- `OMEConfig` gains `retry_backoff_base_seconds`, `retry_backoff_cap_seconds`,
+  and `retry_jitter_seconds` for the retry-loop sleep.
+- `AgentSkillReader.list_by_cluster()` enumerates the cluster's SKILL.md
+  files from markdown (strong-consistency existence check).
+- **`[cascade]` settings section** — the four maintenance cadences
+  (`optimize_heartbeat_seconds`, `optimize_prune_interval_seconds`,
+  `optimize_prune_retention_seconds`, `optimize_rebuild_interval_seconds`) are
+  now configurable. They were already constructor arguments on `CascadeWorker`,
+  but `CascadeConfig` did not carry them and no production path passed one, so
+  the defaults were unreachable — which is why the 12h rebuild sweep could not
+  be exercised by any soak run shorter than half a day. The deadlines that
+  bound a hung call are deliberately **not** exposed: they are hang-catchers
+  sized from measured durations, where too low manufactures failures on a
+  healthy table and too high leaves a wedged one invisible for longer. Note
+  `optimize_prune_retention_seconds` has a second effect worth reading before
+  tuning — it also decides how long index files keep a manifest naming them,
+  and below LanceDB's 7-day unverified window they then wait out the full 7
+  days.
+
+### Changed
+
+- **`extract_foresight` now ships disabled** (`enabled=False`). Not because
+  it is broken — the crash below is fixed — but because it is one LLM call
+  per sender per memcell whose output nothing in EverOS reads today: no
+  search route surfaces foresights and no prompt slot consumes them. Until
+  something does, running it by default spends tokens on write-only data.
+  **Re-enable per install** in `ome.toml` (hot-reloaded, no restart):
+
+  ```toml
+  [strategies.extract_foresight]
+  enabled = true
+  ```
+
+  Editing `default_ome.toml` alone would not have reached existing installs
+  — `everos init` does not overwrite an existing `~/.everos/ome.toml` — so
+  the code default is what changed.
+- **`extract_foresight` no longer crashes on a memcell containing tool
+  calls.** The sender scan read `m.role` off every item, but only
+  `ChatMessage` carries it (`ToolCallRequest` has `sender_id` without it,
+  `ToolCallResult` has neither), so the first tool call raised
+  `AttributeError` — before any sender was resolved. The strategy was
+  correct on plain user chat and dead-lettered every time on agent
+  trajectories. everalgo explicitly contracts for the mixed case
+  (`user_memory/_render.chat_messages`: the caller need not pre-filter),
+  and every other user-memory extractor gets that for free by delegating;
+  this was the one place the filter was hand-rolled. The scan now tests
+  `isinstance(m, ChatMessage)`, so a pure agent trajectory yields no senders
+  and returns without an LLM call. Matters even with the strategy off by
+  default: it is what makes the opt-in above actually usable.
+- **`SkillClusterUpdated` carries the case's 1024-dim embedding, growing the
+  OME `run_record` table.** The event payload is persisted verbatim in
+  `run_record.event_payload` (and in the APScheduler jobstore while a job is
+  queued), so a `skill_cluster_updated` record goes from roughly 0.8 KB to
+  14 KB. At the default `max_records_per_strategy = 1000` ring buffer that is
+  ~14 MB for this one strategy instead of ~0.8 MB. **Operators sizing
+  `~/.everos/.index/sqlite/ome.db` should expect this.** The vector is only
+  read when a cluster holds more skills than `MAX_SKILLS_IN_PROMPT`, so it
+  usually rides along unused; trimming it from the persisted copy is not a
+  local change, because crash recovery replays `event_payload` to rebuild the
+  event and a trimmed payload would silently take the recovered run down a
+  different branch than the original. Tracked as a follow-up.
+- **`cascade_lancedb_optimize_conflict` now records `pruned`** — which
+  maintenance beat lost the commit race. Lance labels both beats' commit the
+  same way (`This Rewrite transaction was preempted by concurrent transaction
+  …`), so the message alone cannot separate a free loss from a costly one: a
+  lost **light** beat retries ~10s later, while a lost **heavy** beat means
+  that table skipped a whole prune cadence and its superseded files stay on
+  disk. Attributing index-dir growth previously meant back-inferring which
+  beats were heavy from the 300s cadence. Log level (`debug`) and the
+  benign-conflict semantics are unchanged — this adds one field.
+
+### Upgrade
+
+Two behaviour changes to know about before upgrading.
+
+`extract_foresight` now ships disabled — a deployment relying on foresight
+entries must set `enabled = true` for it in `ome.toml`.
+
+`SkillClusterUpdated` now carries the case's 1024-dim embedding, so a
+`skill_cluster_updated` row in the OME `run_record` table grows from ~0.8 KB to
+~14 KB — about 14 MB for that strategy's default 1000-record ring buffer,
+against ~0.8 MB before. Anyone sizing `~/.everos/.index/sqlite/ome.db` should
+account for it.
+
+Nothing else needs action: the new `[cascade]` section is optional and a config
+written by an earlier version falls back to the same defaults (verified on a
+clean install).
+
+One deployment note. When a supervised background loop crashes repeatedly and
+exhausts its restart budget, the worker now sends itself `SIGTERM` rather than
+serving on with a dead projection pipeline. That assumes something restarts the
+process — systemd `Restart=always`, Docker `restart: unless-stopped`, a k8s
+Deployment. Without one the process simply stops, which is still preferable to a
+server answering searches from a silently frozen index, but it is worth knowing
+before the first time it happens.
+
+## [1.2.2] - 2026-08-04
+
+### Added
+
+- **`GET /health` now carries a `cascade` readiness block** — `healthy`,
+  human-readable `reasons`, and the counters behind them (`pending`,
+  `failed_permanent`, `failed_retryable`, `drain_consecutive_failures`,
+  `unrecoverable_total`, `optimize_failure_streak`, `prune_stale_seconds`).
+  `null` when the app runs without the cascade lifespan. **Alert on
+  `cascade.healthy`**: it flips false only on operational faults — drain loop
+  failing (≥3 in a row), index maintenance wedged (≥5), or version cleanup
+  stalled on some table (≥3 missed 300s beats, and `reasons` names the table).
+  `failed_permanent` is a data-quality backlog awaiting `cascade fix` and
+  deliberately does **not** flip `healthy`, otherwise the signal sits red until
+  a human edits markdown. The HTTP status stays 200 even when the block says
+  unhealthy — it is a liveness signal, and a degraded projection must not
+  trigger a container restart. If the probe itself fails (locked / full
+  SQLite), the block returns `healthy=false` with a `cascade health probe
+  failed: …` reason and zeroed counters — read zeros next to that reason as
+  "unknown", not "clean".
+- **`everos cascade rebuild` CLI command** — drops every business LanceDB table,
+  clears the cascade queue, and re-indexes all markdown from scratch. The
+  supported recovery from a drifted or corrupt index: unlike deleting the index
+  directory, it re-enqueues every file (a bare `rm -rf` leaves the queue marked
+  `done`, so nothing re-indexes and the index comes back empty), and unlike
+  deleting `.index/` it preserves SQLite state that markdown cannot rebuild —
+  notably `unprocessed_buffer`. **Requires the server to be stopped**: it
+  refuses to start (exit code `3`) while a server holds the OME lock, because a
+  live daemon keeps writing through cached table handles to the dropped
+  dataset. `--yes/-y` for non-interactive use; `Ctrl-C` exits `130` and the
+  re-index resumes on the next run or server start.
+- **Startup schema verification now detects column *type* drift**, not just
+  missing / extra columns. Catches the class of corruption behind #337 — an
+  `episode.subject_vector` left as `string` by an older build while the schema
+  declares a 1024-d `fixed_size_list` — which a name-only check waved through
+  and which then failed deep inside `merge_insert` with an opaque
+  `LanceError(IO)`. The error now points at `everos cascade rebuild`.
+
+### Changed
+
+- **LanceDB maintenance is split into compaction and reclamation.**
+  `optimize()` is lock-free compaction; the new `prune()` runs
+  `cleanup_older_than` under the per-table write lock. Fixes unbounded index
+  growth: the previous bundled call issued a Rewrite that concurrent writes
+  kept preempting, so version cleanup lost the race indefinitely (a soak run
+  measured 16 successes against 547 conflicts over 21h, with the index
+  directory growing to the disk guardrail). Reclamation now completes on every
+  beat, at the cost of a brief same-table write stall (measured ~40ms).
+  Retention is decoupled from cadence: files older than 60s are eligible,
+  reclaimed on a 300s beat.
+- **Every write-lock critical section is now bounded.** All seven operations
+  (`add` / `upsert` / `update` / `delete` / `delete_by_md_path` / `prune` /
+  `rebuild_indexes`) run under a deadline that covers **lock acquisition as
+  well as the body**, so no code path can wait for the lock — or hold it —
+  indefinitely. Budgets are sized from measured durations (row writes are
+  2–25ms, worst observed 63ms → 15s; index rebuild → 300s; prune → 60s).
+  Expiry raises the retryable `VectorStoreBusyError`, so the cascade worker
+  retries the row instead of marking it permanently failed. Without this, one
+  operation stuck outside the old narrow timeout wedged a table permanently:
+  every writer blocked on acquire, and the maintenance scheduler skipped a kind
+  whose task never finished, so that table stopped reclaiming versions
+  altogether (observed: 150 versions retained, disk 11x live size, with nothing
+  logged because nothing failed).
+- **Benign LanceDB commit conflicts no longer count as failures.** A lost
+  optimistic-concurrency race logs at `debug` on either maintenance beat. The
+  heavy beat needs this too: its write lock is in-process only, so a second
+  process (`cascade sync`, `cascade backfill`) can preempt its commit. Counting
+  those triggered spurious fallback index rebuilds, which drop every index
+  before recreating them — and if the rebuild also lost the race, the table sat
+  without an FTS index and every search on that kind returned 500 until the
+  next 12h sweep.
+- **A query vector whose width disagrees with the embedding provider's declared
+  `dim` now fails immediately** with `CONFIGURATION_ERROR` instead of reaching
+  LanceDB. It previously surfaced as an opaque `ValueError` after the query was
+  built — 13–14s per request, as an unhandled 500.
+- **Exception logging no longer renders frame locals.** structlog's default
+  traceback formatter (`show_locals=True`, up to 100 frames) rendered one
+  unhandled exception on an async stack into 6423 log lines — 85MB of logs
+  across 11 exceptions in one soak run — at ~290ms of synchronous CPU each, and
+  risked printing request payloads into logs. Now locals-off and capped at 15
+  frames: the same traceback is 103 lines.
+- **`cascade backfill` reclaims through the daemon's retention window** rather
+  than at zero age, so it cannot delete files out from under an in-flight
+  `/search` in the server process.
+- **`lancedb` pinned to `>=0.34.0,<0.35.0`.** 0.35 embeds lance-rust v9; 0.34.0
+  is the version validated under sustained churn. Environments installing from
+  `uv.lock` are unaffected (already 0.34.0). Never widen the floor below 0.34 —
+  older lance cannot read v8 data.
+
+### Fixed
+
+- **Maintenance deadlines now cover the whole call, not just the critical
+  section.** Resolving a table handle sat outside the timeout, so a hang there
+  never returned — and because the scheduler runs one maintenance task per kind
+  and skips a kind whose task is in flight, that table stopped being maintained
+  permanently and silently (a soak run caught one table 13 minutes without a
+  reclaim, retained versions climbing, while its siblings reclaimed normally and
+  nothing was logged because nothing failed). Handle resolution moved inside the
+  deadline for all seven locked operations, the lock-free compaction beat got
+  its own deadline, and the scheduler adds a last-resort 180s bound on the whole
+  call. The per-kind staleness alert added in this release is what surfaced it.
+- **AGENTIC search crashed on agent memory** (`agent_case` / `agent_skill`) —
+  candidate metadata now satisfies the everalgo `_format_docs` contract,
+  removing a `TypeError` in the sufficiency / multi-query steps.
+- **Per-kind version-cleanup staleness is no longer masked.** The health signal
+  reported time since the newest successful prune across all kinds, so on a
+  multi-kind deployment one kind whose cleanup died was hidden by the others
+  pruning on schedule. It now reports the worst kind and names it.
+- **`cascade backfill` silently skipped compaction and reclamation** — it still
+  called the removed `optimize(cleanup_older_than=…)` signature, and the
+  resulting `TypeError` was swallowed by a best-effort `except`, so the disk
+  growth this release fixes came back after every backfill.
+- **Empty `_indices/<uuid>/` husks are removed after cleanup** (a soak run
+  accumulated 13061 directories, 98% of them empty), which bloated inode usage
+  and slowed directory scans.
+
+### Docs
+
+- Rewrote the cascade runbook's recovery paths: the `/health` cascade block and
+  its alert thresholds, `cascade rebuild` (including the stop-the-server
+  requirement), why `rm -rf .index/lancedb` yields an empty index, and why
+  `rm -rf .index` loses un-extracted buffered messages.
+
+## [1.2.1] - 2026-07-29
+
+### Added
+
+- **`[embedding]` and `[rerank]` are now soft runtime dependencies** — EverOS
+  boots and serves requests with only `[llm]` configured. Missing or
+  misconfigured embedding / rerank / multimodal providers no longer abort
+  startup; the corresponding accessor logs `<provider>_capability_build_failed`
+  and reports `available=False`. Features degrade gracefully into three tiers:
+  Tier 1 (`[llm]` only) → KEYWORD search + add/flush + md writes + cascade sync;
+  Tier 2 (`+ [embedding]`) → adds VECTOR/HYBRID search + reflection + skill
+  extraction + backfill; Tier 3 (`+ [rerank]`) → adds AGENTIC search + knowledge
+  write/search. Tier upgrades require a server restart. Downgrades are
+  read-safe: knowledge documents stay readable/renamable/deletable after
+  a Tier-3 → Tier-2 downgrade; only write / search endpoints return 422.
+- **`everos cascade backfill` CLI command** — three-phase interactive
+  backfill (`vectors` → `clusters` → `skills`, or `--phase all`) for
+  upgrading Tier-1 rows to Tier-2 after `[embedding]` is configured. Each
+  phase prints row/token estimates and blocks on `y/N`; `--yes`/`-y` for
+  CI. Exit codes: `0` success, `1` user declined, `2` phase preconditions
+  unmet, `3` server running, `4` completed-with-failures, `130` SIGINT.
+- **LanceDB schema v2** — the six business tables (`episode`, `atomic_fact`,
+  `foresight`, `agent_case`, `agent_skill`, `knowledge_topic`) now allow
+  `vector NULL`. Cascade writes rows without vectors when `[embedding]` is
+  unavailable; a later backfill fills them in. Migration runs once on first
+  startup under a cross-process `memory_root_lock` (`fcntl.flock`),
+  followed by `optimize(cleanup_older_than=timedelta(0))` per table to
+  physically prune older manifest versions.
+- **Startup unbackfilled-rows banner** — after LanceDB lifespan, an
+  unconditional sweep emits `unbackfilled_memory_rows` when rows with
+  `vector IS NULL` exist, pointing at `everos cascade backfill` in the
+  hint text.
+- **PyPI Trusted Publishing workflow** — tag-triggered `.github/workflows/release.yml`
+  builds, smoke-tests, and uploads via OIDC (no stored token) behind the
+  `release` environment's manual-approval gate. Version-tag mismatch
+  aborts publish. Companion `/release` skill lives under
+  `.claude/skills/release/`.
+
+### Changed
+
+- **`ProviderNotConfiguredError` → HTTP 422 `CAPABILITY_UNAVAILABLE`** —
+  write / search endpoints that need embed or rerank now return 422 with
+  a section-aware hint (points at `everos.toml` section, never at
+  `EVEROS_*` env vars) instead of erroring at startup or 500-ing at
+  request time.
+- **`GET /health` returns a Pydantic `HealthResponse` model** — with typed
+  `capabilities` and `disabled_features` fields, so OpenAPI codegen
+  produces real shapes instead of `additionalProperties: true`.
+- **`MemoryRoot.default()` → `MemoryRoot.resolve()`** — the classmethod
+  that resolves the memory root from `--root` / `EVEROS_ROOT` / default was
+  renamed to make its behavior explicit (`resolve` walks the precedence
+  chain; `default` was ambiguous with "default location"). `MemoryRoot`
+  is publicly exported from `everos.core.persistence`; callers outside
+  the repo may have used the old name. **A `default()` alias is kept**
+  as a backward-compatibility shim that forwards to `resolve()` and
+  emits a `DeprecationWarning`. The alias will be removed in a future
+  major release — update call sites when convenient.
+- **Uncalibrated recall scores moved to their own name** — `KEYWORD` and
+  single-route `VECTOR` searches now report their top score as
+  `recall_top_score_raw`; `recall_top_score` is reserved for the calibrated
+  methods (`HYBRID` LR sigmoid, `AGENTIC` cross-encoder), whose values share a
+  comparable `[0, 1]` scale. Langfuse aggregates scores by name, so the previous
+  single name meant a chart could average an unbounded BM25 score together with
+  a probability. Every recall score also carries
+  `metadata = {"method": ..., "calibrated": ...}` now, a structured field that
+  can be split on, alongside the existing human-readable comment. Dashboards
+  built on `recall_top_score` for keyword search need to switch to the new name.
+- **Docs and examples now use `/api/v2`** — README, QUICKSTART, the `docs/`
+  reference set, the Langfuse example, and `everos demo --live` all call the
+  canonical `/api/v2` prefix instead of `/api/v1`. `/api/v1` keeps resolving
+  to the same handlers, so nothing breaks; it is now described as a **legacy
+  compatibility alias that may be removed in a future major release** rather
+  than a permanent one. New integrations should target `/api/v2`.
+- **`cluster_repo.find_cluster_id_for_member` now requires
+  `(app_id, project_id, owner_id)`** — reverse-index lookups JOIN `Cluster`
+  for scope filtering. `entry_id` is per-owner unique by design; the
+  reverse index alone could collide across owners writing on the same day.
+- **All six cascade handlers register unconditionally** — Tier-3 → Tier-2/1
+  downgrade no longer strands DELETE / PATCH events. Embed-requiring
+  branches inside each handler body-guard on capability availability at
+  execution time.
+- **Interactive TTY log level defaults to WARNING** — avoids INFO log lines
+  drowning out backfill y/N prompts; non-interactive / CI stays at INFO.
+  `--verbose` / `-v` forces INFO.
+- **`click>=8.1` promoted to first-class dependency** — was previously
+  transitive via typer. `typer.Abort` and `click.exceptions.Abort` are
+  distinct classes under typer 0.15+ (typer vendored click); the interrupt
+  catch in `cascade backfill` covers both.
+- **Test harness pins `EVEROS_ROOT` to a temp path** — `conftest.py` scrubs
+  every `EVEROS_*` env var so a developer's `~/.everos/everos.toml` cannot
+  make tests accidentally green against a real provider.
+
+### Fixed
+
+- **Fixes present in `1.1.4` but missing from `1.2.0`** — cascade retry
+  classification + total-retry budget, the delete/modify race, the
+  embedding empty-data guard, and episode extraction retries (each
+  detailed under 1.1.4) were absent from the branch `1.2.0` was built
+  from, so `1.2.0` regressed to pre-1.1.4 behaviour on all of them. See
+  Security below for the path traversal.
+- **Filename validation on knowledge upload** — NUL byte and > 255-byte
+  UTF-8 filenames now fail fast with `InvalidInputError → HTTP 400`
+  instead of surfacing OS errors as 500 with a half-written md file.
+- **HTML upload no longer takes the UTF-8 fast-path** — knowledge
+  upload's plaintext short-circuit uses an explicit allowlist
+  (`text/plain`, `text/markdown`, `text/x-rst`, `text/x-markdown`) plus
+  known extensions; `text/html` is deliberately excluded so HTML still
+  goes through everalgo's `clean_html_for_llm`. Prevents 503 when a
+  Tier-3 user without `[multimodal]` uploads a markdown doc.
+- **Broken table-of-contents links in `docs/api.md`** — the endpoint anchors
+  still pointed at the pre-1.2.0 `#post-apiv1…` slugs after the headings moved
+  to `/api/v2`, so all five endpoint links in the TOC were dead.
+
+### Removed
+
+- **README "Star us" section** — cleanup.
+
+### Security
+
+- **Knowledge upload path traversal (CWE-22)** — see the 1.1.4 entry for
+  the fix description. **Affected:** every release before `1.1.4`, and
+  `1.2.0`. **Not affected:** `1.1.4`. **Fixed in:** `1.2.1`. The fix
+  shipped in `1.1.4` but was not present on the branch `1.2.0` was built
+  from, so upgrading `1.1.4` → `1.2.0` reintroduced it.
+
+## [1.2.0] - 2026-07-24
+
+> This release is missing fixes that shipped in `1.1.4`, including a
+> knowledge-upload path traversal (CWE-22). See the Security section
+> under 1.2.1 for the affected-version range.
+
+### Added
+
+- **`/api/v2` API prefix** — every business endpoint (`memory/*`, `ome/*`,
+  `knowledge/*`) is now served under `/api/v2`, aligning the open-source API
+  with the EverOS Cloud contract. `/api/v1` is retained as a legacy
+  compatibility alias: both prefixes resolve to the same handlers with
+  identical request/response contracts, so existing integrations keep working
+  unchanged. Infrastructure endpoints (`/health`, `/metrics`) stay unversioned.
+- **Native OpenTelemetry tracing** — memory operations (add / flush, memcell
+  boundary, episode extraction, search, and OME reflection) export to any
+  OTLP backend (e.g. Langfuse) as nested traces carrying LLM/embedding token
+  usage, per-request correlation, and recall-quality scores. Off by default;
+  enabled via the `[observability]` config with the optional `otel` extra.
+  Content capture (query / extracted memory) is opt-in and redaction-aware.
+
+## [1.1.4] - 2026-07-20
+
+> The entries below reflect the code shipped as `everos==1.1.4` on PyPI.
+> The 1.1.4 sdist was built from the internal release lane and contains
+> fixes that were not represented in this file when 1.1.4 was tagged;
+> this section restores them so the changelog matches the wheel.
+
+### Fixed
+
+- **Knowledge upload path traversal (CWE-22)** — the original-file write
+  path is now contained to the document directory; adversarial filenames
+  (`..`, absolute paths, symlink games) are rejected on
+  `POST /api/v1/knowledge/documents` and `POST /api/v2/knowledge/documents`.
+- **Cascade reliability — retry classification, budget, and races** — the
+  worker catches `ExternalServiceError` (embedding / LLM / rerank transient
+  failures) and retries inline up to 3 times before marking
+  `retryable=True`; a total retry budget of 12 attempts across scanner
+  cycles bounds retries on prolonged outages. The reconciler no longer
+  re-enqueues `pending` / `processing` rows on stable mtime (previously
+  overwrote the worker's `mark_done`); `failed` rows with
+  `retryable=False` on stable mtime skip auto-retry so users can edit and
+  re-save. SQLite `REAL` float precision loss in mtime comparisons is
+  now absorbed via a 10 ms tolerance. LanceDB `optimize()` failures
+  escalate to a `drop_index + create_index` rebuild after 5 consecutive
+  misses (workaround for `lance-format/lance#7653` panic path).
+- **Cascade delete/modify race** — when a file disappears after its
+  modified event is queued, the worker processes it as a deletion
+  instead of leaving a stale indexed row and permanently failed queue
+  item.
+- **Embedding provider raises on empty API data** — the provider now
+  raises `EmbeddingServiceError` when the API returns HTTP 200 with an
+  empty `data` array (previously silently returned zero-length vectors,
+  corrupting search).
+- **Episode extraction retries on malformed LLM output** — the `/flush`
+  synchronous path retries everalgo `ValueError` (typically OpenRouter
+  truncated responses) twice with 1 s / 2 s backoff before surfacing a
+  500.
+- **Langfuse live-server traces use only real telemetry** — synthetic
+  child spans are now limited to responses that provide stage details,
+  while real servers emit accurate top-level latency, output, and
+  recall-quality scores.
+
+### Added
+
+- **Optional `dimensions` parameter for MRL-capable embedding models** —
+  opt-in via `[embedding] dimensions = N` in `everos.toml`; forwarded to
+  the API for server-side truncation with re-normalization (OpenAI
+  text-embedding-3-\*, Qwen3-Embedding).
+- **LLM `finish_reason` diagnostic warnings** — logs `content_len` /
+  `content_tail` / `model` when the provider returns a non-`stop`
+  `finish_reason`, aiding OpenRouter truncation triage.
+- **Langfuse integration example** — added an OpenTelemetry-based
+  wrapper for tracing EverOS add, flush/extract, search, and reflection
+  operations, with a built-in mock and support for connecting to a real
+  EverOS server.
+
+### Changed
+
+- **`everalgo-user-memory` bumped 0.3.1 → 0.3.2**.
+
+## [1.1.3] - 2026-07-10
+
+### Fixed
+
+- **LanceDB FTS optimize crash and disk growth** — disabled unused positional
+  data in OR-mode BM25 indexes, automatically rebuilds affected indexes, and
+  escalates repeated optimize failures so cleanup cannot fail silently.
+
+## [1.1.2] - 2026-07-07
+
+### Fixed
+
+- **Agent-track search broken by `deprecated_by IS NULL` filter** —
+  `compile_filters()` unconditionally appended a `deprecated_by IS NULL`
+  clause to every LanceDB query, but only `episode` and `atomic_fact`
+  tables have this column. Agent-track search (`agent_case`,
+  `agent_skill`) failed on any method. The clause is now conditional on
+  `owner_type == "user"`.
+
+## [1.1.1] - 2026-07-06
+
+### Added
+
+- **DashScope rerank provider** — Aliyun Bailian `gte-rerank-v2` adapter;
+  configure with `rerank.provider = "dashscope"` in `everos.toml`.
+- **`everos demo` TUI command** — Textual-based interactive CLI demo for
+  showcasing EverOS core features.
+- **Benchmark runner** — full LoCoMo benchmark suite: `benchmarks/run.py`
+  with TOML configuration, automated ingestion, search evaluation, and
+  scoring.
+- **Hybrid search: heap-expand algorithm** — rewrote `hierarchy.py` to
+  heap-driven lazy expansion with global top-N competition, replacing the
+  serial four-layer pipeline.
+
+### Fixed
+
+- **Knowledge: atomic upsert prevents StaleDataError** — cascade handler
+  switched from get→update to `INSERT ... ON CONFLICT DO UPDATE`, fixing
+  concurrent cascade race conditions.
+- **API: OpenAPI version read from `__version__`** — no longer hardcoded to
+  `0.1.0`; version now stays in sync with `pyproject.toml`.
+- **Profile middleware no longer swallows exceptions** — inner handler
+  errors now re-raise correctly instead of silently returning HTTP 200.
+
+### Performance
+
+- **Cascade optimize throttle 1s → 10s** — reduced unnecessary LanceDB
+  `optimize()` I/O by raising the minimum interval between calls.
+
+### CI / Build
+
+- **CI Python version matrix** — test and integration jobs now run on both
+  Python 3.12 and 3.13.
+- **pyproject.toml improvements** — added `project.urls`, `Typing :: Typed`
+  classifier, relaxed `jieba` version constraint, removed unused
+  `python-dotenv` dependency, cleaned up sdist include list, added `RUF`
+  lint rules and coverage configuration.
+- **`make ci` includes coverage** — `ci` target now runs
+  `lint + test + integration + cov`.
+
+### Documentation
+
+- Fixed stale references across 13 files (v1.1.0 freshness sweep).
+- Added GitHub sync guide (`docs/github-sync.md`).
+- Added v1.1.0 release notes and v1.0.0 migration guide as standalone docs.
+- Added `README.zh-CN.md` (Chinese README).
+- Expanded `QUICKSTART.md` with source install instructions and `uv run`
+  usage notes.
+- Clarified cascade `optimize()` semantics in docstrings and runbook.
+
+## [1.1.0] - 2026-06-24
+
+### Added
+
+- **Knowledge base subsystem** — full-stack document management exposed via
+  `/api/v1/knowledge/*`. Upload documents (PDF / HTML / DOCX via multimodal
+  parser), CRUD operations, and hybrid search (BM25 + vector + rerank +
+  category boost). Ships with a 20-category default taxonomy
+  (`.taxonomy.md`, auto-generated on first use). Original uploaded files are
+  preserved alongside extracted Markdown. New settings group:
+  `knowledge.*` (search tuning, `max_upload_bytes`, etc.).
+- **Reflection V1** — offline memory self-improvement engine.
+  Select → Merge → Re-extract → Deprecate: clusters related episodes within
+  existing 7-day windows, merges them via LLM, re-extracts consolidated
+  episodes, and deprecates the originals. Runs as an OME strategy
+  (`reflect_episodes`); configure via `ome.toml`
+  (`[strategies.reflect_episodes]`, cron `0 2 * * 1`), changes are
+  hot-reloaded within ~2 s, no restart needed; **disabled by default**.
+  Requires `everalgo-user-memory>=0.3.1`.
+- **Standardized error response contract.** All API errors now return a
+  canonical envelope with a semantic `ErrorCode` (10 codes: `NOT_FOUND`,
+  `CONFLICT`, `INVALID_INPUT`, `EXTRACTION_EMPTY`, `UNSUPPORTED_FORMAT`,
+  `EXTERNAL_SERVICE_UNAVAILABLE`, `CAPABILITY_UNAVAILABLE`,
+  `CONFIGURATION_ERROR`, `INTERNAL_ERROR`, `BAD_REQUEST`), per-type
+  exception handlers with MRO dispatch, and an `ErrorResponse` Pydantic
+  model visible in OpenAPI docs. Replaces the v1.0 two-code scheme
+  (`HTTP_ERROR` / `SYSTEM_ERROR`).
+- **Search: hierarchical fact eviction** (Layer-4) with `min_score` floor —
+  low-confidence atomic facts are evicted before fusion, improving
+  precision.
+- **Knowledge search degradation guidance** — when the embedding or rerank
+  provider fails at call time, the knowledge search route enriches the
+  error message with actionable guidance (e.g. retry with `method=keyword`,
+  which needs no embedding) before returning `503`.
+- **Knowledge topic recaller** — dual-column BM25 recall for knowledge
+  topics, integrated into the search manager alongside existing recall
+  types.
+
+### Changed
+
+- **`everos init` now generates `gpt-4.1-mini`** as the default LLM model
+  (was `gpt-4o-mini`). Existing user configurations are not affected.
+- **API error `code` values have changed.** v1.0 returned only `HTTP_ERROR`
+  (all 4xx) and `SYSTEM_ERROR` (all 5xx). v1.1 returns fine-grained
+  semantic codes (see Added above). Clients that match on `error.code`
+  string values need to update. The envelope structure
+  (`request_id` + `error.{code, message, timestamp, path}`) is unchanged.
+- **DDD-aligned exception hierarchy** — domain errors reorganized:
+  `ValidationError` → `InvalidInputError`;
+  `DocumentAlreadyExistsError` → `DuplicateDocumentError`;
+  `EmbeddingError` → `EmbeddingServiceError`;
+  `RerankError` → `RerankServiceError`;
+  `LLMError` → `LLMServiceError` (at the boundary);
+  `MultimodalError` split into `UnsupportedModalityError` (domain) +
+  `MultimodalNotEnabledError` (infrastructure).
+  New base classes: `CapabilityError`, `ConfigurationError`.
+- **`infra/` restructured** — storage adapters moved under
+  `infra/persistence/{markdown,sqlite,lancedb}`; each sub-package's
+  `__init__.py` is the sole public API (enforced by import-linter).
+- **Parser capability extracted** to `component/parser` (shared by memorize
+  and knowledge upload paths).
+
+### Fixed
+
+- **Knowledge search no longer returns a bare `500 INTERNAL_ERROR` when the
+  embedding or rerank provider is unconfigured.** `_require_search_providers`
+  now raises `ConfigurationError` → `500 CONFIGURATION_ERROR`. A provider
+  that is configured but fails at call time still surfaces as
+  `503 EXTERNAL_SERVICE_UNAVAILABLE`.
+- **Knowledge document uploads are capped** at `knowledge.max_upload_bytes`
+  (default 50 MiB); oversized uploads are rejected with `422` before parsing.
+- **Knowledge search `query` is bounded** to 2000 chars.
+- **`GET /knowledge/documents?sort_by=updated_at`** is now accepted.
+- **`POST /knowledge/documents` returns `original_file_path`** so callers no
+  longer need a follow-up `GET` to locate the preserved upload.
+- **Rerank providers no longer echo the upstream HTTP response body** into the
+  client-facing `503` message (vLLM / DeepInfra); the body is logged instead.
+- **Knowledge FK cascade race** — removed the foreign key on
+  `knowledge_topics.doc_id` that caused delete-order race conditions;
+  cascade cleanup handled at application level.
+- **Knowledge `replace_document`** — atomic PUT: backup old Markdown before
+  re-extraction; removed explicit SQLite delete for atomicity.
+- **Knowledge duplicate `doc_id`** rejected on create; title collision
+  resolved by appending `doc_id` to directory name.
+- **Knowledge `md_path` resolution** fixed in `delete_document` (was not
+  resolved against `memory_root`).
+- **OME file-handle leak** — portalocker file handle is now closed on lock
+  contention instead of being left open.
+- **jieba / Python 3.12 compatibility** — deferred jieba import to avoid
+  `SyntaxError` from invalid escape sequences; suppressed
+  `DeprecationWarning` in tests.
+- **Test isolation** — tests no longer leak `.env` state or depend on module
+  import ordering.
+
+### Documentation
+
+- Added knowledge base technical documentation.
+- Corrected the onboarding flow: `everos init` writes `everos.toml` +
+  `ome.toml` (TOML), not a `.env` file; removed the nonexistent
+  `--xdg` / `--env-file` options and the false `0600`-permissions claim
+  from `README.md` / `QUICKSTART.md`; fixed the stable-version line
+  (`v1.0.1`) and completed the `docs/cli.md` command tree.
+- Updated error handling docs to match the new DDD exception hierarchy.
+
+## [1.0.1] - 2026-06-16
+
+### Security
+
+- **Path-traversal hardening for caller-supplied identifiers.** `sender_id`
+  (which flows through to `owner_id` and becomes a directory segment on the
+  episode write path) now carries the same path-safety guard as `app_id` /
+  `project_id`: a character whitelist plus rejection of the `.` / `..` tokens.
+  The whitelist admits `@` and `+` so real-world ids (email-style,
+  plus-addressing) still pass.
+- **Defense-in-depth write containment.** `MarkdownWriter` now rejects any
+  write target that resolves outside the configured memory root, before any
+  filesystem touch (both the write `mkdir` and the append read-modify-write
+  read). This backstop holds even if an identifier reaches the writer
+  unsanitised (e.g. an `owner_id` set in the extract pipeline rather than from
+  the DTO). The API layer maps the resulting error to HTTP 400.
+
+### Documentation
+
+- Add a multimodal usage guide and correct the multimodal error semantics
+  after end-to-end verification.
+- Rename the algorithm library to `everalgo` across docs and
+  code comments (no code identifiers changed).
+- Fix accuracy drift found in an adversarial doc audit; reflect the
+  `everalgo` packages being published and the v1.0.0 stable status.
+
+## [1.0.0] - 2026-06-03
+
+First public release of EverOS — a Markdown-first memory extraction framework
+for AI agents.
+
+### Added
+
+- **Markdown as source of truth** — all memory persists as plain `.md` files you
+  can open, edit, grep, and version with Git.
+- **Lightweight three-piece storage** — Markdown (truth) + SQLite (state / queue
+  / audit) + LanceDB (vector + BM25 + scalar index). No external services
+  required.
+- **Hybrid retrieval** — BM25, vector, and scalar filtering in a single LanceDB
+  query.
+- **Cascade index sync** — editing a `.md` file triggers a file watcher →
+  entry-level diff → sub-second LanceDB sync.
+- **Dual-track memory** — user-track (Episodes / Profiles) and agent-track
+  (Cases / Skills).
+- **Multi-source extraction** — conversations, workflows, agent traces, and file
+  knowledge.
+- **CLI + HTTP API** — the `everos` command-line tool and a FastAPI server,
+  async-first throughout.
+- **Pluggable providers** — LLM / embedding / rerank via the OpenAI-compatible
+  protocol (works with OpenAI, OpenRouter, vLLM, Ollama, …).
+- **Decoupled algorithms** — memory extraction algorithms live in the standalone
+  `everalgo-*` libraries published on PyPI.
+
+[Unreleased]: https://github.com/EverMind-AI/EverOS/compare/v1.6.0...HEAD
+[1.6.0]: https://github.com/EverMind-AI/EverOS/compare/v1.5.1...v1.6.0
+[1.3.1]: https://github.com/EverMind-AI/everos/compare/v1.3.0...v1.3.1
+[1.3.0]: https://github.com/EverMind-AI/everos/compare/v1.2.3...v1.3.0
+[1.1.4]: https://github.com/EverMind-AI/everos/compare/v1.1.3...v1.1.4
+[1.1.3]: https://github.com/EverMind-AI/everos/compare/v1.1.2...v1.1.3
+[1.1.2]: https://github.com/EverMind-AI/everos/compare/v1.1.1...v1.1.2
+[1.1.1]: https://github.com/EverMind-AI/everos/compare/v1.1.0...v1.1.1
+[1.1.0]: https://github.com/EverMind-AI/everos/compare/v1.0.1...v1.1.0
+[1.0.1]: https://github.com/EverMind-AI/everos/releases/tag/v1.0.1
+[1.0.0]: https://github.com/EverMind-AI/everos/releases/tag/v1.0.0

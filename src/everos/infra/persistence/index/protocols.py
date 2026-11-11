@@ -1,0 +1,271 @@
+"""Typed ports for the rebuildable derived-index subsystem."""
+
+from __future__ import annotations
+
+import datetime as dt
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar, overload, runtime_checkable
+
+from pydantic import BaseModel
+
+from everos.memory.ports.query import Filter
+
+if TYPE_CHECKING:
+    from .repositories import IndexRepositories
+
+T_co = TypeVar("T_co", bound=BaseModel, covariant=True)
+T = TypeVar("T", bound=BaseModel)
+
+
+@runtime_checkable
+class IndexRepository(Protocol[T]):
+    """Backend-neutral repository contract used by memory and cascade.
+
+    Maintenance methods are deliberately part of the contract. Embedded
+    engines can perform physical work; service-managed engines implement
+    successful no-ops. This keeps scheduling and health semantics identical
+    without making the cascade worker know which backend is active.
+    """
+
+    schema: type[T]
+
+    @property
+    def table_name(self) -> str: ...
+
+    async def upsert(self, records: Sequence[T]) -> None:
+        """Merge ``records`` on the table's declared ``PRIMARY_KEY``.
+
+        The only write on the contract: no plain insert and no caller-chosen
+        key, so two rows with one key cannot be created through it.
+        """
+        ...
+
+    async def count(self) -> int: ...
+
+    async def count_where(self, where: Filter | None = None) -> int: ...
+
+    async def find_where(
+        self, where: Filter, *, limit: int = 100, skip_vectors: bool = False
+    ) -> list[T]: ...
+
+    async def find_one_where(self, where: Filter) -> T | None: ...
+
+    async def find_by_md_path(self, md_path: str) -> T | None: ...
+
+    async def find_by_owner_entry(
+        self,
+        owner_id: str,
+        entry_id: str,
+        *,
+        app_id: str = "default",
+        project_id: str = "default",
+    ) -> T | None: ...
+
+    @overload
+    async def find_by_owner_entries(
+        self,
+        owner_id: str,
+        entry_ids: Sequence[str],
+        *,
+        app_id: str = "default",
+        project_id: str = "default",
+        columns: None = None,
+        skip_vectors: bool = False,
+    ) -> list[T]: ...
+
+    @overload
+    async def find_by_owner_entries(
+        self,
+        owner_id: str,
+        entry_ids: Sequence[str],
+        *,
+        app_id: str = "default",
+        project_id: str = "default",
+        columns: Sequence[str],
+        skip_vectors: bool = False,
+    ) -> list[dict[str, Any]]: ...
+
+    async def find_by_owner_entries(
+        self,
+        owner_id: str,
+        entry_ids: Sequence[str],
+        *,
+        app_id: str = "default",
+        project_id: str = "default",
+        columns: Sequence[str] | None = None,
+        skip_vectors: bool = False,
+    ) -> list[T] | list[dict[str, Any]]: ...
+
+    async def find_by_session(
+        self, owner_id: str, session_id: str, *, limit: int = 100
+    ) -> list[T]: ...
+
+    async def find_by_parent(
+        self, parent_type: str, parent_id: str, *, limit: int = 100
+    ) -> list[T]: ...
+
+    async def find_where_paginated(
+        self,
+        where: Filter,
+        *,
+        sort_by: str,
+        descending: bool = True,
+        page: int = 1,
+        page_size: int = 20,
+        max_fetch: int = 20_000,
+    ) -> tuple[list[T], int]: ...
+
+    async def search(
+        self,
+        *,
+        vector: Sequence[float] | None = None,
+        where: Filter | None = None,
+        limit: int = 10,
+        with_vectors: bool = False,
+    ) -> list[dict[str, Any]]: ...
+
+    async def sparse_search(
+        self,
+        query_terms: Sequence[str],
+        where: Filter | None,
+        *,
+        columns: Sequence[str] | None = None,
+        limit: int,
+        with_vectors: bool = False,
+    ) -> list[dict[str, Any]]: ...
+
+    async def dense_search(
+        self,
+        vector: Sequence[float],
+        where: Filter | None,
+        *,
+        limit: int,
+        vector_field: str = "vector",
+        with_vectors: bool = False,
+    ) -> list[dict[str, Any]]: ...
+
+    async def scan(
+        self, where: Filter | None = None, *, with_vectors: bool = False
+    ) -> list[T]:
+        """Every matching record; vector fields are ``None`` unless
+        ``with_vectors`` (backends may still fill them)."""
+        ...
+
+    async def count_duplicate_keys(self) -> int:
+        """Extra rows sharing one declared ``PRIMARY_KEY`` tuple.
+
+        A key-only read: implementations must not materialise the full row
+        (vectors included), because the check runs on roots where that is
+        the whole index in memory. ``upsert`` cannot create a duplicate, so
+        a non-zero answer means a write bypassed it.
+        """
+        ...
+
+    async def update(self, updates: dict[str, Any], *, where: Filter) -> None: ...
+
+    async def delete(self, predicate: Filter) -> None: ...
+
+    async def delete_by_md_path(self, md_path: str) -> int: ...
+
+    async def optimize(self) -> None: ...
+
+    async def prune(self, older_than: dt.timedelta) -> None: ...
+
+    async def rebuild_indexes(self) -> None: ...
+
+    async def ensure_vector_indexes(self) -> None: ...
+
+
+@runtime_checkable
+class EpisodeIndexRepository(IndexRepository[T], Protocol[T]):
+    """Episode-only reads every backend must also provide."""
+
+    async def count_by_owner(
+        self,
+        owner_id: str,
+        *,
+        app_id: str = "default",
+        project_id: str = "default",
+        parent_type: str | None = None,
+    ) -> int: ...
+
+    async def list_by_owner_after_ts(
+        self,
+        *,
+        owner_id: str,
+        after_ts: int,
+        parent_type: str,
+        app_id: str = "default",
+        project_id: str = "default",
+        columns: Sequence[str] | None = None,
+        limit: int | None = None,
+    ) -> list[Any]: ...
+
+
+@runtime_checkable
+class AgentSkillIndexRepository(IndexRepository[T], Protocol[T]):
+    """AgentSkill-only cluster reads every backend must also provide."""
+
+    async def count_in_cluster(self, *, owner_id: str, cluster_id: str) -> int: ...
+
+    async def find_in_cluster(
+        self, *, owner_id: str, cluster_id: str, limit: int
+    ) -> list[Any]: ...
+
+    async def find_topk_relevant_in_cluster(
+        self,
+        *,
+        owner_id: str,
+        cluster_id: str,
+        query_vector: Sequence[float],
+        top_k: int,
+    ) -> list[Any]: ...
+
+
+@runtime_checkable
+class IndexBackend(Protocol):
+    """Lifecycle contract for one configured derived-index backend."""
+
+    name: str
+    repositories: IndexRepositories
+
+    async def connect(self) -> object: ...
+
+    async def shutdown(self) -> None: ...
+
+    async def ensure_business_indexes(self) -> None: ...
+
+    async def verify_business_schemas(self) -> None: ...
+
+    async def drop_business_tables(self) -> list[str]: ...
+
+    async def read_embedding_model(self) -> str | None:
+        """Model this index's vectors were built with, ``None`` if unattested.
+
+        Vectors from two different models are not comparable, so an index has
+        to remember which one produced it. *Where* that is kept is the
+        backend's business -- field metadata, a collection property, whatever
+        travels with the data -- the port only says it travels.
+
+        ``None`` means "not attested yet" (a fresh index, or one from before
+        this field existed), not "failed to read": a backend that cannot read
+        raises, so the caller can tell the two apart and refuse to overwrite
+        what it could not see.
+        """
+        ...
+
+    async def write_embedding_model(self, model: str) -> None:
+        """Attest ``model`` as the producer of this index's vectors.
+
+        Must not rewrite stored data: an existing deployment adopting this
+        field keeps its rows and column types untouched.
+        """
+        ...
+
+
+__all__ = [
+    "AgentSkillIndexRepository",
+    "EpisodeIndexRepository",
+    "IndexBackend",
+    "IndexRepository",
+]

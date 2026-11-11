@@ -1,0 +1,218 @@
+"""``everos server start`` — argument resolution + uvicorn handoff.
+
+Uvicorn ``run`` is the external boundary and is mocked. We assert the
+host/port/log_level resolution chain (CLI flag > env > default) and the
+KeyboardInterrupt / OSError exit paths.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+
+import pytest
+from typer.testing import CliRunner
+
+from everos.entrypoints.cli.commands import server as server_mod
+from everos.entrypoints.cli.main import app as root_app
+
+
+@pytest.fixture(autouse=True)
+def _isolate_env(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Strip EVEROS_* env vars so default resolution is deterministic."""
+    for k in list(os.environ):
+        if k.startswith("EVEROS_"):
+            monkeypatch.delenv(k, raising=False)
+    monkeypatch.delenv("EVEROS_LOG_LEVEL", raising=False)
+    # ``server start`` exports its level override; register the variable so
+    # monkeypatch removes it again after the test.
+    monkeypatch.setenv("EVEROS_LOGGING__LEVEL", "")
+    monkeypatch.delenv("EVEROS_LOGGING__LEVEL")
+    monkeypatch.setenv("EVEROS_ROOT", str(tmp_path))
+    (tmp_path / "everos.toml").write_text("# test\n")
+    from everos.config import load_settings
+
+    load_settings.cache_clear()
+
+
+@pytest.fixture
+def captured(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    """Mock ``uvicorn.run`` and return the kwargs it was called with."""
+    captured: dict[str, object] = {}
+
+    def fake_run(*args: object, **kwargs: object) -> None:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(server_mod.uvicorn, "run", fake_run)
+    return captured
+
+
+def test_start_uses_default_host_port_log_level(captured: dict[str, object]) -> None:
+    result = CliRunner().invoke(root_app, ["server", "start"])
+    assert result.exit_code == 0, result.stdout
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["host"] == "127.0.0.1"
+    assert kwargs["port"] == 8000
+    assert kwargs["log_level"] == "info"
+    assert kwargs["factory"] is True
+    args = captured["args"]
+    assert args == ("everos.entrypoints.api.app:create_app",)
+
+
+def test_start_cli_flags_override_env(
+    captured: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("EVEROS_API__HOST", "1.2.3.4")
+    monkeypatch.setenv("EVEROS_API__PORT", "9000")
+    monkeypatch.setenv("EVEROS_API__LOG_LEVEL", "debug")
+    from everos.config import load_settings
+
+    load_settings.cache_clear()
+    result = CliRunner().invoke(
+        root_app,
+        [
+            "server",
+            "start",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "8765",
+            "--log-level",
+            "warning",
+        ],
+    )
+    assert result.exit_code == 0, result.stdout
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["host"] == "127.0.0.1"
+    assert kwargs["port"] == 8765
+    assert kwargs["log_level"] == "warning"
+
+
+def test_start_falls_back_to_env_when_flags_omitted(
+    captured: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("EVEROS_API__HOST", "10.0.0.1")
+    monkeypatch.setenv("EVEROS_API__PORT", "8765")
+    from everos.config import load_settings
+
+    load_settings.cache_clear()
+    result = CliRunner().invoke(root_app, ["server", "start"])
+    assert result.exit_code == 0, result.stdout
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["host"] == "10.0.0.1"
+    assert kwargs["port"] == 8765
+
+
+def test_start_log_level_flag_sets_the_process_and_uvicorn_level(
+    captured: dict[str, object],
+) -> None:
+    result = CliRunner().invoke(root_app, ["server", "start", "--log-level", "debug"])
+    assert result.exit_code == 0, result.stdout
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["log_level"] == "debug"
+    assert logging.getLogger().level == logging.DEBUG
+    # The app factory reloads settings; it must see the same level.
+    assert os.environ["EVEROS_LOGGING__LEVEL"] == "DEBUG"
+
+
+def test_start_log_level_env_is_honoured(
+    captured: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("EVEROS_LOG_LEVEL", "warning")
+    result = CliRunner().invoke(root_app, ["server", "start"])
+    assert result.exit_code == 0, result.stdout
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["log_level"] == "warning"
+    assert logging.getLogger().level == logging.WARNING
+
+
+def test_start_log_level_falls_back_to_the_logging_section(
+    captured: dict[str, object],
+    tmp_path,  # type: ignore[no-untyped-def]
+) -> None:
+    (tmp_path / "everos.toml").write_text('[logging]\nlevel = "ERROR"\n')
+    result = CliRunner().invoke(root_app, ["server", "start"])
+    assert result.exit_code == 0, result.stdout
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["log_level"] == "error"
+    assert logging.getLogger().level == logging.ERROR
+
+
+def test_start_swallows_keyboard_interrupt(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(*args: object, **kwargs: object) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(server_mod.uvicorn, "run", boom)
+    result = CliRunner().invoke(root_app, ["server", "start"])
+    assert result.exit_code == 0
+
+
+def test_start_exits_one_on_os_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(*args: object, **kwargs: object) -> None:
+        raise OSError("port in use")
+
+    monkeypatch.setattr(server_mod.uvicorn, "run", boom)
+    result = CliRunner().invoke(root_app, ["server", "start"])
+    assert result.exit_code == 1
+
+
+def test_start_with_root_option(
+    captured: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,  # type: ignore[no-untyped-def]
+) -> None:
+    """``--root`` sets EVEROS_ROOT for settings resolution."""
+    from everos.config import load_settings
+
+    load_settings.cache_clear()
+    result = CliRunner().invoke(root_app, ["server", "start", "--root", str(tmp_path)])
+    assert result.exit_code == 0, result.stdout
+    assert "kwargs" in captured
+
+
+@pytest.mark.parametrize(
+    ("host", "port", "expected"),
+    [
+        ("127.0.0.1", 8000, "http://127.0.0.1:8000"),
+        ("0.0.0.0", 8000, "http://127.0.0.1:8000"),
+        ("::", 9000, "http://127.0.0.1:9000"),
+        ("::1", 8000, "http://[::1]:8000"),
+        ("10.0.0.5", 8765, "http://10.0.0.5:8765"),
+    ],
+)
+def test_mcp_base_url_is_something_a_client_can_dial(
+    host: str, port: int, expected: str
+) -> None:
+    assert server_mod.mcp_base_url(host, port) == expected
+
+
+def test_start_logs_mcp_hint_with_client_url(captured: dict[str, object]) -> None:
+    import logging
+
+    records: list[str] = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record.getMessage())
+
+    handler = _Collect()
+    logger = logging.getLogger("everos.cli.server")
+    logger.addHandler(handler)
+    try:
+        result = CliRunner().invoke(
+            root_app, ["server", "start", "--host", "0.0.0.0", "--port", "9000"]
+        )
+    finally:
+        logger.removeHandler(handler)
+    assert result.exit_code == 0, result.stdout
+    hint = [r for r in records if "uvx everos-mcp" in r]
+    assert hint, records
+    assert "EVEROS_BASE_URL=http://127.0.0.1:9000" in hint[0]
+    assert server_mod.MCP_GUIDE_URL in hint[0]

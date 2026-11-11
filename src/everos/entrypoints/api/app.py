@@ -1,0 +1,158 @@
+"""FastAPI application factory.
+
+Wires CORS + the project's middleware stack + global exception handler +
+lifespan, and registers the public routes (``/health``, ``/metrics``).
+
+The lifespan owns one :class:`~everos.service.Application`: it starts it on
+startup, keeps it on ``app.state.application`` (the only object routes read,
+via :func:`everos.entrypoints.api.dependencies.application`) and closes it on
+shutdown.
+"""
+
+from __future__ import annotations
+
+import os
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from everos.config import Settings, load_settings
+from everos.core.observability.logging import get_logger
+from everos.entrypoints.api.middleware import (
+    DEFAULT_CORS_ALLOW_CREDENTIALS,
+    DEFAULT_CORS_ALLOW_HEADERS,
+    DEFAULT_CORS_ALLOW_METHODS,
+    DEFAULT_CORS_ORIGINS,
+    ProfileMiddleware,
+    PrometheusMiddleware,
+    RequestIdMiddleware,
+)
+from everos.service import Application, build_application
+
+from .exception_handlers import register_handlers
+from .routes import (
+    cascade,
+    delete,
+    get,
+    health,
+    knowledge,
+    memorize,
+    metrics,
+    ome,
+    search,
+    tasks,
+)
+
+logger = get_logger(__name__)
+
+
+def _docs_enabled() -> bool:
+    """Enable docs endpoints (/docs, /redoc, /openapi.json) only in dev."""
+    return os.environ.get("ENV", "prod").upper() == "DEV"
+
+
+def create_app(
+    settings: Settings | None = None,
+    *,
+    application: Application | None = None,
+    cors_origins: list[str] | None = None,
+    cors_allow_credentials: bool = DEFAULT_CORS_ALLOW_CREDENTIALS,
+    cors_allow_methods: list[str] | None = None,
+    cors_allow_headers: list[str] | None = None,
+) -> FastAPI:
+    """Build the FastAPI application instance.
+
+    Args:
+        settings: Settings to build the :class:`Application` from when none is
+            injected; ``None`` loads them when the lifespan starts.
+        application: A pre-built application (tests inject one assembled
+            over fakes). It is reachable by routes at once, and the lifespan
+            starts and closes it like one it built itself.
+        cors_origins: Allowed CORS origins (default: ``["*"]``).
+        cors_allow_credentials: Whether to allow credentials (default: True).
+        cors_allow_methods: Allowed CORS methods (default: ``["*"]``).
+        cors_allow_headers: Allowed CORS headers (default: ``["*"]``).
+
+    Returns:
+        FastAPI: Configured application instance.
+    """
+    enable_docs = _docs_enabled()
+
+    @asynccontextmanager
+    async def lifespan(fastapi_app: FastAPI) -> AsyncIterator[None]:
+        built = application or build_application(settings or load_settings())
+        fastapi_app.state.application = built
+        try:
+            await built.start()
+            yield
+        finally:
+            await built.aclose()
+
+    from everos import __version__
+
+    app = FastAPI(
+        title="everos",
+        version=__version__,
+        description="md-first memory extraction framework",
+        lifespan=lifespan,
+        docs_url="/docs" if enable_docs else None,
+        redoc_url="/redoc" if enable_docs else None,
+        openapi_url="/openapi.json" if enable_docs else None,
+    )
+
+    if application is not None:
+        app.state.application = application
+
+    # Exception handlers
+    register_handlers(app)
+
+    # Middleware order: earlier `add_middleware` calls become inner, later ones outer.
+    # CORS innermost (matches base_app.py legacy pattern).
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=cors_origins or DEFAULT_CORS_ORIGINS,
+        allow_credentials=cors_allow_credentials,
+        allow_methods=cors_allow_methods or DEFAULT_CORS_ALLOW_METHODS,
+        allow_headers=cors_allow_headers or DEFAULT_CORS_ALLOW_HEADERS,
+    )
+    app.add_middleware(PrometheusMiddleware)
+    app.add_middleware(ProfileMiddleware)
+    # Outermost: every request gets a request id before any other middleware
+    # or handler runs, so all logs + the response header carry it.
+    app.add_middleware(RequestIdMiddleware)
+
+    # Infra endpoints — deliberately unversioned.
+    app.include_router(health.router)
+    app.include_router(metrics.router)
+
+    # Business API — served under both /api/v2 (canonical, cloud-aligned name)
+    # and /api/v1 (legacy compatibility alias, removable in a future major).
+    # The same router object is mounted twice, so both prefixes resolve to the
+    # exact same handlers; FastAPI's default operationId embeds the path, so
+    # the two copies get distinct OpenAPI ids automatically (no collision).
+    # v1 and v2 stay identical by construction — see test_api_versioning.
+    # v1 first — legacy alias, behavior identical.
+    app.include_router(memorize.router, prefix="/api/v1")
+    app.include_router(search.router, prefix="/api/v1")
+    app.include_router(get.router, prefix="/api/v1")
+    app.include_router(delete.router, prefix="/api/v1")
+    app.include_router(ome.router, prefix="/api/v1")
+    app.include_router(knowledge.router, prefix="/api/v1")
+    # Operational, not a memory API: it stops a background subsystem. Mounted on
+    # both prefixes so a caller does not have to know which one this build serves.
+    app.include_router(cascade.router, prefix="/api/v1")
+    app.include_router(tasks.router, prefix="/api/v1")
+    # v2 — cloud-aligned name, same routers.
+    app.include_router(memorize.router, prefix="/api/v2")
+    app.include_router(search.router, prefix="/api/v2")
+    app.include_router(get.router, prefix="/api/v2")
+    app.include_router(delete.router, prefix="/api/v2")
+    app.include_router(ome.router, prefix="/api/v2")
+    app.include_router(knowledge.router, prefix="/api/v2")
+    app.include_router(cascade.router, prefix="/api/v2")
+    app.include_router(tasks.router, prefix="/api/v2")
+
+    logger.info("app_created", docs_enabled=enable_docs)
+    return app

