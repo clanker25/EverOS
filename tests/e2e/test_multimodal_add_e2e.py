@@ -1,0 +1,165 @@
+"""E2E: multimodal /add parses HTML (base64) and http(s) uri end-to-end.
+
+Scope: full HTTP stack (``create_app()`` + ``AsyncClient``) → ingest →
+multimodal parse → unprocessed_buffer. Proves the three paths the unit
+tests can only mock:
+
+1. ``type="html"`` + base64 + ``ext="html"`` — the normal HTML-file call.
+2. ``type="html"`` + ``https`` uri — everalgo fetches the page and
+   dispatches by the response Content-Type.
+3. ``type="html"`` + ``file://`` uri — EverOS reads the file locally and
+   hands everalgo hydrated bytes (the library never touches the fs).
+
+Real multimodal LLM (creds via ``.env``) + real public internet, so the
+module is marked ``live_llm``. Skipped when the ``[multimodal]`` extra is
+absent.
+
+White-box surface: reads the ``text`` column of ``unprocessed_buffer``
+(the derived text the ingest stage produced from the parsed content) to
+assert the parsed payload actually flowed into the write path. The
+session's memcell payloads are read too: the boundary closes a segment the
+model judges complete into a cell at once, so a single parsed message may
+already have left the buffer by the time ``/add`` returns.
+"""
+
+from __future__ import annotations
+
+import base64
+from pathlib import Path
+
+import httpx
+import pytest
+from sqlalchemy import text as sql_text
+
+from tests.fakes.storage import StorageView
+
+pytest.importorskip("everalgo.parser")
+
+pytestmark = pytest.mark.live_llm
+
+
+async def _ingested_text(storage_view: StorageView, session_id: str) -> str:
+    """Derived text of a session's buffer rows and memcell payloads, joined.
+
+    A parsed message sits in ``unprocessed_buffer`` until the boundary cuts
+    it; a segment the model judges complete is cut at once, so the text may
+    already be in a memcell's ``payload_json`` when ``/add`` returns.
+    """
+    async with storage_view.database.engine.connect() as conn:
+        buffered = (
+            await conn.execute(
+                sql_text("SELECT text FROM unprocessed_buffer WHERE session_id = :sid"),
+                {"sid": session_id},
+            )
+        ).all()
+        cells = (
+            await conn.execute(
+                sql_text("SELECT payload_json FROM memcell WHERE session_id = :sid"),
+                {"sid": session_id},
+            )
+        ).all()
+    return "\n".join(str(r[0]) for r in [*buffered, *cells])
+
+
+async def test_add_html_base64_parsed_into_buffer(
+    async_client: httpx.AsyncClient, storage_view: StorageView
+) -> None:
+    """A base64 HTML file is parsed and its text lands in the buffer."""
+    html = (
+        b"<html><body><h1>Release</h1>"
+        b"<p>Version 9.9.9 ships Dark Mode.</p></body></html>"
+    )
+    sid = "e2e-mm-html-b64"
+    resp = await async_client.post(
+        "/api/v1/memory/add",
+        json={
+            "session_id": sid,
+            "messages": [
+                {
+                    "sender_id": "alice",
+                    "role": "user",
+                    "timestamp": 1780304400000,
+                    "content": [
+                        {
+                            "type": "html",
+                            "base64": base64.b64encode(html).decode(),
+                            "ext": "html",
+                            "name": "notes.html",
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+    buffered = await _ingested_text(storage_view, sid)
+    assert "9.9.9" in buffered
+
+
+async def test_add_html_https_uri_parsed_into_buffer(
+    async_client: httpx.AsyncClient, storage_view: StorageView
+) -> None:
+    """An https uri is fetched + parsed and its text lands in the buffer."""
+    sid = "e2e-mm-html-uri"
+    resp = await async_client.post(
+        "/api/v1/memory/add",
+        json={
+            "session_id": sid,
+            "messages": [
+                {
+                    "sender_id": "alice",
+                    "role": "user",
+                    "timestamp": 1780304400000,
+                    "content": [{"type": "html", "uri": "https://example.com"}],
+                }
+            ],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+    buffered = await _ingested_text(storage_view, sid)
+    # example.com's markup is not a stable fixture: the <h1>Example Domain</h1>
+    # that used to sit in its body is gone (2026-10), leaving that string only
+    # in <title>, which the body-text parser does not emit. Assert what this
+    # test is actually for -- the page was fetched, dispatched to the HTML
+    # parser, and its text reached the buffer -- not one sentence of someone
+    # else's copy.
+    assert buffered.strip(), "nothing landed in the buffer or a memcell"
+    assert "[HTML]" in buffered, (
+        f"payload not dispatched to the HTML parser: {buffered!r}"
+    )
+    assert "documentation" in buffered.lower(), (
+        f"fetched text does not look like example.com: {buffered!r}"
+    )
+
+
+async def test_add_html_file_uri_parsed_into_buffer(
+    async_client: httpx.AsyncClient, tmp_path: Path, storage_view: StorageView
+) -> None:
+    """A file:// html asset is read locally (hydrated) + parsed into buffer.
+
+    Exercises EverOS-side file:// support: the parser receives bytes, never
+    the path. Default allowlist is empty (local-first) so the temp file reads.
+    """
+    doc = tmp_path / "release.html"
+    doc.write_text("<html><body><p>Version 9.9.9 ships Dark Mode.</p></body></html>")
+    sid = "e2e-mm-html-file"
+    resp = await async_client.post(
+        "/api/v1/memory/add",
+        json={
+            "session_id": sid,
+            "messages": [
+                {
+                    "sender_id": "alice",
+                    "role": "user",
+                    "timestamp": 1780304400000,
+                    "content": [{"type": "html", "uri": doc.as_uri()}],
+                }
+            ],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+    buffered = await _ingested_text(storage_view, sid)
+    assert "9.9.9" in buffered
