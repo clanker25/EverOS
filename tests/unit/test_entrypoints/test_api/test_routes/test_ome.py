@@ -1,0 +1,168 @@
+"""Route tests for ``POST /api/v1/ome/trigger``.
+
+Pins the widened ``TriggerResponse`` contract from Task 7: a ``dispatched``
+count and a per-run ``runs`` list are always present, and ``status`` gains
+``not_dispatched`` for strategies rejected by a dispatch gate (as opposed to
+``ok``/``timeout``, which mean the strategy was actually enqueued and either
+settled or didn't within the wait window).
+
+Each test wires a bare FastAPI app carrying only the ``ome`` router to a
+real, started ``OfflineEngine`` (no lifespan, no LanceDB, no LLM) through a
+real ``OpsService`` whose only live collaborator is that engine.
+"""
+
+from __future__ import annotations
+
+from collections.abc import AsyncIterator
+from pathlib import Path
+
+import pytest
+from fastapi import FastAPI
+from httpx import ASGITransport, AsyncClient
+
+from everos.entrypoints.api.routes.ome import router as ome_router
+from everos.infra.ome.config import OMEConfig
+from everos.infra.ome.engine import OfflineEngine
+from everos.memory.deps import MemoryDeps
+from everos.memory.ports import Cron, CronTick, Event, Immediate, ManualTick
+from tests.fakes import make_application
+from tests.fakes.application import make_ops
+from tests.helpers.ome import ome_strategy
+
+
+async def _client_for(
+    engine: OfflineEngine, monkeypatch: pytest.MonkeyPatch
+) -> AsyncClient:
+    """FastAPI app exposing only the ome router, wired to ``engine``."""
+    app = FastAPI()
+    app.state.application = make_application(ops=make_ops(engine=engine))
+    app.include_router(ome_router, prefix="/api/v1")
+    return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
+
+
+@pytest.fixture
+async def gated_off_engine(tmp_path: Path) -> AsyncIterator[OfflineEngine]:
+    """Engine with one strategy registered but ``enabled=False``."""
+
+    @ome_strategy(
+        name="gated_off_strategy",
+        trigger=Immediate(on=[ManualTick]),
+        emits=[],
+        enabled=False,
+    )
+    async def _s(event: ManualTick, deps: MemoryDeps) -> list[Event]:
+        return []
+
+    engine = OfflineEngine(
+        config=OMEConfig(jobstore_path=tmp_path / "ome.db", config_watch=False)
+    )
+    engine.register(_s)
+    await engine.start()
+    try:
+        yield engine
+    finally:
+        await engine.stop()
+
+
+@pytest.fixture
+async def cron_engine(tmp_path: Path) -> AsyncIterator[OfflineEngine]:
+    """Engine with one Cron strategy — the ``reflect_episodes`` shape."""
+
+    @ome_strategy(
+        name="weekly_job",
+        trigger=Cron(expr="0 2 * * 1"),
+        emits=[],
+    )
+    async def _s(event: CronTick, deps: MemoryDeps) -> list[Event]:
+        return []
+
+    engine = OfflineEngine(
+        config=OMEConfig(jobstore_path=tmp_path / "ome.db", config_watch=False)
+    )
+    engine.register(_s)
+    await engine.start()
+    try:
+        yield engine
+    finally:
+        await engine.stop()
+
+
+@pytest.fixture
+async def always_fails_engine(tmp_path: Path) -> AsyncIterator[OfflineEngine]:
+    """Engine with a strategy that raises unconditionally.
+
+    ``max_retries=0`` reaches ``dead_letter`` on the very first attempt —
+    no retry backoff sleep, so the test stays fast under the default runner.
+    """
+
+    @ome_strategy(
+        name="always_fails",
+        trigger=Immediate(on=[ManualTick]),
+        emits=[],
+        max_retries=0,
+    )
+    async def _s(event: ManualTick, deps: MemoryDeps) -> list[Event]:
+        raise RuntimeError("boom")
+
+    engine = OfflineEngine(
+        config=OMEConfig(jobstore_path=tmp_path / "ome.db", config_watch=False)
+    )
+    engine.register(_s)
+    await engine.start()
+    try:
+        yield engine
+    finally:
+        await engine.stop()
+
+
+async def test_trigger_returns_not_dispatched_when_strategy_gated_off(
+    gated_off_engine: OfflineEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A strategy disabled by config, triggered without ``force``, yields
+    ``dispatched=0`` and ``status='not_dispatched'`` with no runs."""
+    async with await _client_for(gated_off_engine, monkeypatch) as client:
+        resp = await client.post(
+            "/api/v1/ome/trigger", json={"name": "gated_off_strategy"}
+        )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "not_dispatched"
+    assert body["dispatched"] == 0
+    assert body["runs"] == []
+
+
+async def test_trigger_returns_runs_including_dead_letter(
+    always_fails_engine: OfflineEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A strategy that raises through all retries dead-letters; the run
+    still appears in ``runs`` with its error, and the top-level ``status``
+    stays ``ok`` — dispatch happened and the run settled (dead-letter is a
+    settled state, not an in-flight one)."""
+    async with await _client_for(always_fails_engine, monkeypatch) as client:
+        resp = await client.post(
+            "/api/v1/ome/trigger",
+            json={"name": "always_fails", "force": True, "timeout": 15},
+        )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["dispatched"] == 1
+    assert len(body["runs"]) == 1
+    assert body["runs"][0]["status"] == "dead_letter"
+    assert body["runs"][0]["error"]
+
+
+@pytest.mark.asyncio
+async def test_trigger_runs_a_cron_strategy_manually(
+    cron_engine: OfflineEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A manual trigger is how a scheduled job is run on demand
+    (docs/reflection.md); it must dispatch, not report ``not_dispatched``."""
+    async with await _client_for(cron_engine, monkeypatch) as client:
+        resp = await client.post(
+            "/api/v1/ome/trigger", json={"name": "weekly_job", "force": True}
+        )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["dispatched"] == 1

